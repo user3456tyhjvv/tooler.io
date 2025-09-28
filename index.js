@@ -74,6 +74,7 @@ const apiLimiter = rateLimit({
 });
 
 // --- DATABASE SETUP FUNCTIONS ---
+
 async function setupDatabase() {
   if (!supabase) {
     console.log('⚠️ Database setup skipped: Supabase client not available');
@@ -81,42 +82,44 @@ async function setupDatabase() {
   }
 
   try {
-    // Just test the connection instead of trying to create tables
+    // Test connection by checking if table exists
     const { data, error } = await supabase
       .from('page_views')
       .select('count')
       .limit(1);
 
     if (error) {
-      console.log('⚠️ Database connection test failed:', error.message);
-      console.log('💡 Make sure your Supabase tables exist. Run this SQL in your Supabase dashboard:');
-      console.log(`
-        CREATE TABLE IF NOT EXISTS page_views (
-          id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-          site_id TEXT NOT NULL,
-          visitor_id TEXT NOT NULL,
-          path TEXT NOT NULL,
-          referrer TEXT,
-          screen_width INTEGER,
-          screen_height INTEGER,
-          language TEXT,
-          timezone TEXT,
-          event_type TEXT DEFAULT 'pageview',
-          created_at TIMESTAMPTZ DEFAULT NOW()
-        );
-        
-        CREATE INDEX IF NOT EXISTS idx_page_views_site_id ON page_views(site_id);
-        CREATE INDEX IF NOT EXISTS idx_page_views_created_at ON page_views(created_at);
-      `);
+      console.log('📋 Table might not exist. Attempting to create tables...');
+      await createTables();
     } else {
-      console.log('✅ Database connection successful');
+      console.log('✅ Database connection successful - tables exist');
     }
   } catch (error) {
     console.log('⚠️ Database setup error:', error.message);
   }
 }
 
-// Initialize database on startup
+async function createTables() {
+  console.log('💡 Please create the tables manually in Supabase SQL Editor:');
+  console.log(`
+    CREATE TABLE IF NOT EXISTS page_views (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      site_id TEXT NOT NULL,
+      visitor_id TEXT NOT NULL,
+      path TEXT NOT NULL,
+      referrer TEXT,
+      screen_width INTEGER,
+      screen_height INTEGER,
+      language TEXT,
+      timezone TEXT,
+      event_type TEXT DEFAULT 'pageview',
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    
+    CREATE INDEX IF NOT EXISTS idx_page_views_site_id ON page_views(site_id);
+    CREATE INDEX IF NOT EXISTS idx_page_views_created_at ON page_views(created_at);
+  `);
+}
 setupDatabase();
 
 // --- REAL TRACKING ENDPOINT ---
@@ -187,7 +190,11 @@ app.post('/track', trackLimiter, async (req, res) => {
   }
 });
 
+
 // --- REAL STATS ENDPOINT (NO MOCK DATA) ---
+// In your backend, update the cache settings:
+
+// --- REAL STATS ENDPOINT (FASTER UPDATES) ---
 app.get('/api/stats/:domain', apiLimiter, async (req, res) => {
   const { domain } = req.params;
   
@@ -197,7 +204,9 @@ app.get('/api/stats/:domain', apiLimiter, async (req, res) => {
 
   const cacheKey = `stats:${domain}`;
   const cachedStats = statsCache.get(cacheKey);
-  if (cachedStats) {
+  
+  // Only use cache if it's very fresh (10 seconds)
+  if (cachedStats && (Date.now() - new Date(cachedStats.lastUpdated).getTime()) < 10000) {
     return res.json(cachedStats);
   }
 
@@ -214,13 +223,12 @@ app.get('/api/stats/:domain', apiLimiter, async (req, res) => {
 
       if (error) {
         console.error('Database query error:', error.message);
-        // Continue with empty data instead of throwing
       } else {
         pageViews = data || [];
       }
     }
 
-    // Calculate real statistics (will return zeros if no data)
+    // Calculate real statistics
     const stats = calculateRealStats(pageViews);
     
     console.log('📊 Stats for:', domain, {
@@ -229,14 +237,13 @@ app.get('/api/stats/:domain', apiLimiter, async (req, res) => {
       realData: stats.realData
     });
     
-    // Cache the results for 1 minute only
-    statsCache.set(cacheKey, stats, 60);
+    // Cache for only 10 seconds for near real-time updates
+    statsCache.set(cacheKey, stats, 10);
     
     res.json(stats);
 
   } catch (error) {
     console.error(`Error fetching stats for ${domain}:`, error.message);
-    // Return empty real data instead of mock data
     const emptyStats = {
       totalVisitors: 0,
       newVisitors: 0,
@@ -253,111 +260,6 @@ app.get('/api/stats/:domain', apiLimiter, async (req, res) => {
     res.json(emptyStats);
   }
 });
-
-// Helper function to calculate real statistics (NO MOCK DATA)
-function calculateRealStats(pageViews) {
-  if (!pageViews || pageViews.length === 0) {
-    return {
-      totalVisitors: 0,
-      newVisitors: 0,
-      returningVisitors: 0,
-      bounceRate: 0,
-      avgSessionDuration: 0,
-      pagesPerVisit: 0,
-      lastUpdated: new Date().toISOString(),
-      realData: false,
-      totalPageViews: 0,
-      totalSessions: 0,
-      message: "No tracking data yet. Add the tracker to your website to see real analytics."
-    };
-  }
-
-  const visitors = new Set(pageViews.map(pv => pv.visitor_id));
-  const sessions = new Set();
-  const visitorEvents = {};
-  
-  // Group by visitor
-  pageViews.forEach(pv => {
-    if (!visitorEvents[pv.visitor_id]) {
-      visitorEvents[pv.visitor_id] = [];
-    }
-    visitorEvents[pv.visitor_id].push(pv);
-  });
-
-  // Calculate sessions
-  Object.values(visitorEvents).forEach(events => {
-    events.sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
-    
-    let sessionStart = new Date(events[0].created_at);
-    let sessionId = `${events[0].visitor_id}-${sessionStart.getTime()}`;
-    sessions.add(sessionId);
-
-    for (let i = 1; i < events.length; i++) {
-      const currentTime = new Date(events[i].created_at);
-      const timeDiff = (currentTime - sessionStart) / (1000 * 60);
-      
-      if (timeDiff > 30) {
-        sessionStart = currentTime;
-        sessionId = `${events[i].visitor_id}-${sessionStart.getTime()}`;
-        sessions.add(sessionId);
-      }
-    }
-  });
-
-  // Calculate bounce rate
-  const singlePageSessions = Array.from(sessions).filter(sessionId => {
-    const visitorId = sessionId.split('-')[0];
-    return visitorEvents[visitorId].length === 1;
-  });
-
-  // Calculate session durations
-  let totalSessionDuration = 0;
-  let sessionsWithDuration = 0;
-  
-  Object.values(visitorEvents).forEach(events => {
-    if (events.length > 1) {
-      const sessionStart = new Date(events[0].created_at);
-      const sessionEnd = new Date(events[events.length - 1].created_at);
-      const duration = (sessionEnd - sessionStart) / 1000;
-      if (duration > 0) {
-        totalSessionDuration += duration;
-        sessionsWithDuration++;
-      }
-    }
-  });
-
-  const totalVisitors = visitors.size;
-  const totalSessions = sessions.size;
-  const bounceRate = totalSessions > 0 ? (singlePageSessions.length / totalSessions) * 100 : 0;
-  const avgSessionDuration = sessionsWithDuration > 0 ? Math.floor(totalSessionDuration / sessionsWithDuration) : 0;
-  const pagesPerVisit = totalSessions > 0 ? parseFloat((pageViews.length / totalSessions).toFixed(1)) : 0;
-
-  // Simple new vs returning visitors
-  let newVisitors = 0;
-  let returningVisitors = 0;
-
-  Object.entries(visitorEvents).forEach(([visitorId, events]) => {
-    if (events.length > 1) {
-      returningVisitors++;
-    } else {
-      newVisitors++;
-    }
-  });
-
-  return {
-    totalVisitors,
-    newVisitors,
-    returningVisitors,
-    bounceRate: parseFloat(bounceRate.toFixed(1)),
-    avgSessionDuration,
-    pagesPerVisit,
-    lastUpdated: new Date().toISOString(),
-    realData: true,
-    totalPageViews: pageViews.length,
-    totalSessions: totalSessions
-  };
-}
-
 // --- DEBUG ENDPOINT: Check tracking data ---
 app.get('/api/debug/:domain', apiLimiter, async (req, res) => {
   const { domain } = req.params;
