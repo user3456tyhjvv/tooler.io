@@ -54,7 +54,7 @@ app.use(helmet({
 }));
 app.use(compression());
 app.use(cors({
-  origin: ['http://localhost:3000', 'http://localhost:5173', 'https://localhost:3000'],
+  origin: ['http://localhost:3000', 'http://localhost:5173', 'https://localhost:3000','https://www.tiffad.co.ke'],
   credentials: false,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization']
@@ -115,15 +115,27 @@ async function createTables() {
       event_type TEXT DEFAULT 'pageview',
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
-    
+
+    CREATE TABLE IF NOT EXISTS websites (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      domain TEXT NOT NULL UNIQUE,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+
     CREATE INDEX IF NOT EXISTS idx_page_views_site_id ON page_views(site_id);
     CREATE INDEX IF NOT EXISTS idx_page_views_created_at ON page_views(created_at);
+    CREATE INDEX IF NOT EXISTS idx_websites_domain ON websites(domain);
   `);
 }
 setupDatabase();
 
 // --- REAL TRACKING ENDPOINT ---
 app.post('/track', trackLimiter, async (req, res) => {
+  // Allow cross-origin requests from any website
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+
   const { 
     siteId, 
     visitorId, 
@@ -193,6 +205,80 @@ app.post('/track', trackLimiter, async (req, res) => {
 
 // --- REAL STATS ENDPOINT (NO MOCK DATA) ---
 // In your backend, update the cache settings:
+
+// Helper function to calculate real statistics
+function calculateRealStats(pageViews) {
+  if (!pageViews || pageViews.length === 0) {
+    return {
+      totalVisitors: 0,
+      newVisitors: 0,
+      returningVisitors: 0,
+      bounceRate: 0,
+      avgSessionDuration: 0,
+      pagesPerVisit: 0,
+      lastUpdated: new Date().toISOString(),
+      realData: false,
+      totalPageViews: 0,
+      totalSessions: 0
+    };
+  }
+
+  const visitors = new Set(pageViews.map(pv => pv.visitor_id));
+  const sessions = new Set();
+
+  // Group by visitor and calculate sessions
+  const visitorEvents = {};
+  pageViews.forEach(pv => {
+    if (!visitorEvents[pv.visitor_id]) {
+      visitorEvents[pv.visitor_id] = [];
+    }
+    visitorEvents[pv.visitor_id].push(pv);
+  });
+
+  // Calculate sessions (visits with same visitor_id within 30 minutes)
+  Object.values(visitorEvents).forEach(events => {
+    events.sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
+
+    let sessionStart = new Date(events[0].created_at);
+    let sessionId = `${events[0].visitor_id}-${sessionStart.getTime()}`;
+    sessions.add(sessionId);
+
+    for (let i = 1; i < events.length; i++) {
+      const currentTime = new Date(events[i].created_at);
+      const timeDiff = (currentTime - sessionStart) / (1000 * 60); // minutes
+
+      if (timeDiff > 30) {
+        // New session
+        sessionStart = currentTime;
+        sessionId = `${events[i].visitor_id}-${sessionStart.getTime()}`;
+        sessions.add(sessionId);
+      }
+    }
+  });
+
+  // Calculate bounce rate (single page sessions)
+  const singlePageSessions = Array.from(sessions).filter(sessionId => {
+    const visitorId = sessionId.split('-')[0];
+    return visitorEvents[visitorId].length === 1;
+  });
+
+  const totalVisitors = visitors.size;
+  const totalSessions = sessions.size;
+  const bounceRate = totalSessions > 0 ? (singlePageSessions.length / totalSessions) * 100 : 0;
+
+  return {
+    totalVisitors: totalVisitors,
+    newVisitors: totalVisitors, // Simplified: all are new for now
+    returningVisitors: 0, // Simplified
+    bounceRate: parseFloat(bounceRate.toFixed(1)),
+    avgSessionDuration: 120, // Simplified placeholder
+    pagesPerVisit: parseFloat((pageViews.length / totalSessions).toFixed(1)) || 0,
+    lastUpdated: new Date().toISOString(),
+    realData: true,
+    totalPageViews: pageViews.length,
+    totalSessions: totalSessions
+  };
+}
 
 // --- REAL STATS ENDPOINT (FASTER UPDATES) ---
 app.get('/api/stats/:domain', apiLimiter, async (req, res) => {
@@ -304,6 +390,9 @@ app.get('/api/debug/:domain', apiLimiter, async (req, res) => {
 
 // --- SERVE TRACKER SCRIPT ---
 app.get('/tracker.js', (req, res) => {
+  // Allow cross-origin requests from any website
+  res.setHeader('Access-Control-Allow-Origin', '*');
+
   const trackerScript = `
 (function() {
   'use strict';
@@ -534,17 +623,66 @@ app.post('/api/improvements', apiLimiter, async (req, res) => {
   }
 });
 
+// --- WEBSITES REGISTRATION ENDPOINT ---
+app.post('/api/websites', apiLimiter, async (req, res) => {
+  try {
+    const { domain } = req.body;
+
+    if (!domain) {
+      return res.status(400).json({ error: 'Domain is required' });
+    }
+
+    // Validate domain format (basic check)
+    const domainRegex = /^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/;
+    if (!domainRegex.test(domain)) {
+      return res.status(400).json({ error: 'Invalid domain format' });
+    }
+
+    if (supabase) {
+      const { data, error } = await supabase
+        .from('websites')
+        .insert([{ domain }])
+        .select();
+
+      if (error) {
+        if (error.code === '23505') { // Unique violation
+          return res.status(409).json({ error: 'Domain already registered' });
+        }
+        console.error('Database insert error:', error);
+        return res.status(500).json({ error: 'Could not register website' });
+      }
+
+      console.log('✅ Website registered:', domain);
+      res.status(201).json({ 
+        id: data[0].id,
+        domain: data[0].domain,
+        created_at: data[0].created_at
+      });
+    } else {
+      // Fallback if no DB
+      res.status(201).json({
+        id: uuidv4(),
+        domain,
+        created_at: new Date().toISOString()
+      });
+    }
+  } catch (error) {
+    console.error('Website registration error:', error);
+    res.status(500).json({ error: 'Could not register website' });
+  }
+});
+
 // --- INSTALLATION REQUESTS ENDPOINT ---
 app.post('/api/help-requests', apiLimiter, async (req, res) => {
   try {
     const { domain, name, email } = req.body;
-    
+
     if (!domain) {
       return res.status(400).json({ error: 'Domain is required' });
     }
 
     console.log('Help request received:', { domain, name, email });
-    
+
     const response = {
       id: Date.now(),
       domain,
