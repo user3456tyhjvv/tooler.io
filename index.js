@@ -67,7 +67,9 @@ app.use(cors({
       'https://www.tiffad.co.ke',
       'https://tiffad.co.ke',
       'https://www.gigatechshop.co.ke',
-      'https://gigatechshop.co.ke'
+      'https://gigatechshop.co.ke',
+      'https://www.yourspaceanalytics.info',
+      'https://yourspaceanalytics.info'
     ];
     
     if (allowedOrigins.indexOf(origin) !== -1) {
