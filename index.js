@@ -392,13 +392,14 @@ app.get('/api/debug/:domain', apiLimiter, async (req, res) => {
 app.get('/tracker.js', (req, res) => {
   // Allow cross-origin requests from any website
   res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
 
   const trackerScript = `
 (function() {
   'use strict';
 
   const config = {
-    backendUrl: '${req.protocol}://${req.get('host')}',
+    backendUrl: 'https://${req.get('host')}',
     trackEngagement: true,
     trackPageExit: true
   };
