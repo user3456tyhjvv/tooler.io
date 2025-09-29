@@ -53,11 +53,12 @@ app.use(helmet({
   crossOriginEmbedderPolicy: false
 }));
 app.use(compression());
+// Replace your current app.use(cors()) with this:
 app.use(cors({
-  origin: ['http://localhost:3000', 'http://localhost:5173', 'https://localhost:3000','https://www.tiffad.co.ke','https://www.gigatechshop.co.ke'],
-  credentials: false,
+  origin: ['http://localhost:3000', 'http://localhost:5173', 'https://localhost:3000', 'https://www.tiffad.co.ke', 'https://www.gigatechshop.co.ke'],
+  credentials: true, // Set this to true
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization']
+  allowedHeaders: ['Content-Type', 'Authorization', 'Traceparent'] // Added 'Traceparent'
 }));
 app.use(express.json({ limit: '10kb' }));
 
@@ -131,11 +132,7 @@ setupDatabase();
 
 // --- REAL TRACKING ENDPOINT ---
 app.post('/track', trackLimiter, async (req, res) => {
-  // Allow cross-origin requests from any website
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-
+  
   const { 
     siteId, 
     visitorId, 
