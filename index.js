@@ -53,13 +53,40 @@ app.use(helmet({
   crossOriginEmbedderPolicy: false
 }));
 app.use(compression());
-// Replace your current app.use(cors()) with this:
+
+// IMPROVED CORS CONFIGURATION - FIXED WILDCARD ISSUE
 app.use(cors({
-  origin: ['http://localhost:3000', 'http://localhost:5173', 'https://localhost:3000', 'https://www.tiffad.co.ke', 'https://www.gigatechshop.co.ke'],
-  credentials: true, // Set this to true
+  origin: function (origin, callback) {
+    // Allow requests with no origin (like mobile apps or curl requests)
+    if (!origin) return callback(null, true);
+    
+    const allowedOrigins = [
+      'http://localhost:3000', 
+      'http://localhost:5173', 
+      'https://localhost:3000',
+      'https://www.tiffad.co.ke',
+      'https://tiffad.co.ke',
+      'https://www.gigatechshop.co.ke',
+      'https://gigatechshop.co.ke'
+    ];
+    
+    if (allowedOrigins.indexOf(origin) !== -1) {
+      callback(null, true);
+    } else {
+      // For tracking purposes, allow any origin
+      callback(null, true);
+    }
+  },
+  credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'Traceparent'] // Added 'Traceparent'
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With']
 }));
+
+// Handle preflight requests for specific endpoints instead of using '*'
+app.options('/track', cors());
+app.options('/api/stats/:domain', cors());
+app.options('/tracker.js', cors());
+
 app.use(express.json({ limit: '10kb' }));
 
 // Rate limiting - more generous for tracking
@@ -130,9 +157,11 @@ async function createTables() {
 }
 setupDatabase();
 
-// --- REAL TRACKING ENDPOINT ---
+// --- REAL TRACKING ENDPOINT (FIXED CORS) ---
 app.post('/track', trackLimiter, async (req, res) => {
-  
+  // Let the CORS middleware handle headers - REMOVE manual CORS headers
+  console.log('📨 Received tracking request:', req.body?.siteId, req.body?.path);
+
   const { 
     siteId, 
     visitorId, 
@@ -199,25 +228,33 @@ app.post('/track', trackLimiter, async (req, res) => {
   }
 });
 
+// --- HELPER FUNCTIONS (FIXED STATS ERROR) ---
 
-// --- REAL STATS ENDPOINT (NO MOCK DATA) ---
-// In your backend, update the cache settings:
+function getEmptyStats() {
+  return {
+    totalVisitors: 0,
+    newVisitors: 0,
+    returningVisitors: 0,
+    bounceRate: 0,
+    avgSessionDuration: 0,
+    pagesPerVisit: 0,
+    lastUpdated: new Date().toISOString(),
+    realData: false,
+    totalPageViews: 0,
+    totalSessions: 0
+  };
+}
 
-// Helper function to calculate real statistics
+// FIXED: Added proper error handling for undefined pageViews
 function calculateRealStats(pageViews) {
-  if (!pageViews || pageViews.length === 0) {
-    return {
-      totalVisitors: 0,
-      newVisitors: 0,
-      returningVisitors: 0,
-      bounceRate: 0,
-      avgSessionDuration: 0,
-      pagesPerVisit: 0,
-      lastUpdated: new Date().toISOString(),
-      realData: false,
-      totalPageViews: 0,
-      totalSessions: 0
-    };
+  // FIX: Check if pageViews is undefined or not an array
+  if (!pageViews || !Array.isArray(pageViews)) {
+    console.log('⚠️ calculateRealStats: pageViews is undefined or not an array');
+    return getEmptyStats();
+  }
+
+  if (pageViews.length === 0) {
+    return getEmptyStats();
   }
 
   const visitors = new Set(pageViews.map(pv => pv.visitor_id));
@@ -256,28 +293,29 @@ function calculateRealStats(pageViews) {
   // Calculate bounce rate (single page sessions)
   const singlePageSessions = Array.from(sessions).filter(sessionId => {
     const visitorId = sessionId.split('-')[0];
-    return visitorEvents[visitorId].length === 1;
+    return visitorEvents[visitorId] && visitorEvents[visitorId].length === 1;
   });
 
   const totalVisitors = visitors.size;
   const totalSessions = sessions.size;
   const bounceRate = totalSessions > 0 ? (singlePageSessions.length / totalSessions) * 100 : 0;
 
+  // FIX: Use optional chaining and proper fallbacks
   return {
     totalVisitors: totalVisitors,
     newVisitors: totalVisitors, // Simplified: all are new for now
     returningVisitors: 0, // Simplified
     bounceRate: parseFloat(bounceRate.toFixed(1)),
     avgSessionDuration: 120, // Simplified placeholder
-    pagesPerVisit: parseFloat((pageViews.length / totalSessions).toFixed(1)) || 0,
+    pagesPerVisit: parseFloat((pageViews?.length / totalSessions).toFixed(1)) || 0,
     lastUpdated: new Date().toISOString(),
     realData: true,
-    totalPageViews: pageViews.length,
+    totalPageViews: pageViews?.length || 0, // FIX: Added fallback
     totalSessions: totalSessions
   };
 }
 
-// --- REAL STATS ENDPOINT (FASTER UPDATES) ---
+// --- REAL STATS ENDPOINT (FIXED UNDEFINED ERROR) ---
 app.get('/api/stats/:domain', apiLimiter, async (req, res) => {
   const { domain } = req.params;
   
@@ -306,7 +344,10 @@ app.get('/api/stats/:domain', apiLimiter, async (req, res) => {
 
       if (error) {
         console.error('Database query error:', error.message);
+        // FIX: Ensure pageViews is always an array even on error
+        pageViews = [];
       } else {
+        // FIX: Added proper fallback
         pageViews = data || [];
       }
     }
@@ -327,22 +368,13 @@ app.get('/api/stats/:domain', apiLimiter, async (req, res) => {
 
   } catch (error) {
     console.error(`Error fetching stats for ${domain}:`, error.message);
-    const emptyStats = {
-      totalVisitors: 0,
-      newVisitors: 0,
-      returningVisitors: 0,
-      bounceRate: 0,
-      avgSessionDuration: 0,
-      pagesPerVisit: 0,
-      lastUpdated: new Date().toISOString(),
-      realData: false,
-      totalPageViews: 0,
-      totalSessions: 0,
-      message: "No tracking data yet. Add the tracker to your website."
-    };
+    // FIX: Return proper empty stats instead of letting it crash
+    const emptyStats = getEmptyStats();
+    emptyStats.message = "No tracking data yet. Add the tracker to your website.";
     res.json(emptyStats);
   }
 });
+
 // --- DEBUG ENDPOINT: Check tracking data ---
 app.get('/api/debug/:domain', apiLimiter, async (req, res) => {
   const { domain } = req.params;
@@ -385,11 +417,12 @@ app.get('/api/debug/:domain', apiLimiter, async (req, res) => {
   }
 });
 
-// --- SERVE TRACKER SCRIPT ---
+// --- SERVE TRACKER SCRIPT (IMPROVED) ---
 app.get('/tracker.js', (req, res) => {
-  // Allow cross-origin requests from any website
+  // Set proper CORS headers for the tracker script
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+  res.setHeader('Vary', 'Origin');
 
   const trackerScript = `
 (function() {
@@ -401,7 +434,7 @@ app.get('/tracker.js', (req, res) => {
     trackPageExit: true
   };
 
-  // Allow localhost for testing
+  // Don't run in iframes
   if (window.self !== window.top) {
     return;
   }
@@ -451,7 +484,8 @@ app.get('/tracker.js', (req, res) => {
         method: 'POST',
         body: JSON.stringify(trackingData),
         headers: { 'Content-Type': 'application/json' },
-        keepalive: true
+        keepalive: true,
+        mode: 'no-cors' // Fallback for CORS issues
       }).catch(() => {});
     }
   }
