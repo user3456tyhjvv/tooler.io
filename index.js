@@ -54,7 +54,7 @@ app.use(helmet({
 }));
 app.use(compression());
 app.use(cors({
-  origin: ['http://localhost:3000', 'http://localhost:5173', 'https://localhost:3000','https://www.tiffad.co.ke'],
+  origin: ['http://localhost:3000', 'http://localhost:5173', 'https://localhost:3000','https://www.tiffad.co.ke','https://www.gigatechshop.co.ke'],
   credentials: false,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization']
