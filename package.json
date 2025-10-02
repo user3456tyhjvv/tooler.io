@@ -1,6 +1,7 @@
 {
   "name": "backend",
   "version": "1.0.0",
+  "type": "module",
   "main": "index.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
@@ -12,6 +13,9 @@
   "description": "",
   "dependencies": {
     "@google/genai": "^1.21.0",
+    "@paypal/checkout-server-sdk": "^1.0.3",
+    "@paypal/paypal-server-sdk": "^1.1.0",
+    "@paypal/react-paypal-js": "^8.9.1",
     "@supabase/supabase-js": "^2.58.0",
     "compression": "^1.8.1",
     "cors": "^2.8.5",
