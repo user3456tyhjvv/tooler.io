@@ -1,70 +1,47 @@
-            // test-tracking.js
-            const fetch = require('node-fetch');
+import fetch from 'node-fetch';
 
-            async function testTracking() {
-                const baseUrl = 'http://localhost:3001';
-                const domain = 'tiffad.co.ke';
-                
-                console.log('🧪 Starting tracking tests...\n');
+const backendUrl = 'http://localhost:3001';
 
-                // Test 1: Send multiple tracking events
-                for (let i = 1; i <= 5; i++) {
-                    const visitorId = `test-visitor-${i}-${Date.now()}`;
-                    
-                    const trackData = {
-                        siteId: domain,
-                        visitorId: visitorId,
-                        path: `/test-page-${i}`,
-                        referrer: 'https://test.com',
-                        screenWidth: 1920,
-                        screenHeight: 1080,
-                        language: 'en-US',
-                        timezone: 'UTC',
-                        eventType: 'pageview',
-                        timestamp: Date.now()
-                    };
+async function sendTrackingEvent(siteId, visitorId, path) {
+  const response = await fetch(`${backendUrl}/track`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-user-id': 'test-user' },
+    body: JSON.stringify({
+      siteId,
+      visitorId,
+      path,
+      referrer: '',
+      screenWidth: 1920,
+      screenHeight: 1080,
+      language: 'en-US',
+      timezone: 'UTC',
+      eventType: 'pageview',
+      timeOnPage: 30,
+      sessionId: 'session1',
+      utmSource: null,
+      utmMedium: null,
+      utmCampaign: null,
+      timestamp: Date.now()
+    })
+  });
 
-                    try {
-                        const response = await fetch(`${baseUrl}/track`, {
-                            method: 'POST',
-                            headers: {
-                                'Content-Type': 'application/json',
-                            },
-                            body: JSON.stringify(trackData)
-                        });
+  if (response.ok) {
+    console.log(`Tracked event for visitor ${visitorId} on path ${path}`);
+  } else {
+    console.error(`Failed to track event for visitor ${visitorId} on path ${path}`);
+  }
+}
 
-                        console.log(`✅ Event ${i} sent:`, response.status);
-                        
-                        // Small delay between requests
-                        await new Promise(resolve => setTimeout(resolve, 500));
-                    } catch (error) {
-                        console.log(`❌ Event ${i} failed:`, error.message);
-                    }
-                }
+async function runTest() {
+  const siteId = 'example.com';
 
-                // Test 2: Check stats after tracking
-                console.log('\n📊 Checking stats after tracking...');
-                try {
-                    const statsResponse = await fetch(`${baseUrl}/api/stats/${domain}`);
-                    const stats = await statsResponse.json();
-                    console.log('Current stats:', stats);
-                } catch (error) {
-                    console.log('❌ Stats check failed:', error.message);
-                }
+  // Simulate multiple visitors and page views
+  await sendTrackingEvent(siteId, 'visitor1', '/home');
+  await sendTrackingEvent(siteId, 'visitor1', '/about');
+  await sendTrackingEvent(siteId, 'visitor2', '/home');
+  await sendTrackingEvent(siteId, 'visitor3', '/contact');
+  await sendTrackingEvent(siteId, 'visitor2', '/products');
+  await sendTrackingEvent(siteId, 'visitor1', '/checkout');
+}
 
-                // Test 3: Check debug data
-                console.log('\n🐛 Checking debug data...');
-                try {
-                    const debugResponse = await fetch(`${baseUrl}/api/debug/${domain}`);
-                    const debug = await debugResponse.json();
-                    console.log('Debug data:', {
-                        totalRecords: debug.totalRecords,
-                        database: debug.database,
-                        sampleRecords: debug.sampleRecords?.length || 0
-                    });
-                } catch (error) {
-                    console.log('❌ Debug check failed:', error.message);
-                }
-            }
-
-            testTracking();
+runTest().catch(console.error);

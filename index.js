@@ -10,10 +10,21 @@ import helmet from 'helmet';
 import { v4 as uuidv4 } from 'uuid';
 import fetch from "node-fetch";
 import { core } from '@paypal/checkout-server-sdk';
-
+import nodemailer from 'nodemailer';
+import { createServer } from 'http';
+import { Server } from 'socket.io';
 
 const app = express();
+const server = createServer(app);
 const port = process.env.PORT || 3001;
+
+// --- SOCKET.IO SETUP ---
+const io = new Server(server, {
+  cors: {
+    origin: ["http://localhost:3000", "https://yourspaceanalytics.info"],
+    methods: ["GET", "POST"]
+  }
+});
 
 // --- CACHE SETUP ---
 import NodeCache from 'node-cache';
@@ -71,7 +82,142 @@ function getPayPalClient() {
   }
 }
 
+// Email transporter - lazy initialization
+let emailTransporter = null;
+
+// Enhanced email transporter for Brevo
+function getEmailTransporter() {
+  if (emailTransporter) return emailTransporter;
+
+  try {
+    // Check if all required SMTP environment variables are present
+    const requiredVars = ['SMTP_HOST', 'SMTP_USER', 'SMTP_PASS', 'SMTP_FROM'];
+    const missingVars = requiredVars.filter(varName => !process.env[varName]);
+    
+    if (missingVars.length > 0) {
+      console.error('❌ Missing SMTP environment variables:', missingVars);
+      console.log('💡 Brevo SMTP Configuration Guide:');
+      console.log('   1. Log into Brevo → SMTP & API');
+      console.log('   2. Get your SMTP credentials:');
+      console.log('      - Server: smtp-relay.brevo.com');
+      console.log('      - Port: 587');
+      console.log('      - Login: Your Brevo email');
+      console.log('      - Password: Your SMTP key');
+      console.log('   3. Verify sender email in Brevo → Senders & IP');
+      console.log('   4. Add to .env file:');
+      console.log('      SMTP_HOST=smtp-relay.brevo.com');
+      console.log('      SMTP_PORT=587');
+      console.log('      SMTP_USER=your-brevo-email@domain.com');
+      console.log('      SMTP_PASS=your-smtp-key');
+      console.log('      SMTP_FROM=verified-sender@domain.com');
+      return null;
+    }
+
+    console.log('🔧 Initializing Brevo email transporter with:', {
+      host: process.env.SMTP_HOST,
+      port: process.env.SMTP_PORT,
+      user: process.env.SMTP_USER,
+      from: process.env.SMTP_FROM
+    });
+
+    emailTransporter = nodemailer.createTransport({
+      host: process.env.SMTP_HOST,
+      port: parseInt(process.env.SMTP_PORT) || 587,
+      secure: process.env.SMTP_SECURE === 'true', // false for Brevo
+      auth: {
+        user: process.env.SMTP_USER,
+        pass: process.env.SMTP_PASS,
+      },
+      // Brevo-specific settings
+      tls: {
+        rejectUnauthorized: false
+      }
+    });
+
+    // Verify transporter configuration
+    emailTransporter.verify(function (error, success) {
+      if (error) {
+        console.error('❌ Brevo email transporter verification failed:', error);
+        console.log('💡 Troubleshooting tips:');
+        console.log('   - Check your SMTP credentials in Brevo dashboard');
+        console.log('   - Ensure sender email is verified in Brevo');
+        console.log('   - Try alternative Brevo SMTP server: smtp.brevo.com');
+      } else {
+        console.log('✅ Brevo email transporter is ready to send messages');
+      }
+    });
+
+    return emailTransporter;
+  } catch (error) {
+    console.error('❌ Brevo email transporter initialization failed:', error.message);
+    return null;
+  }
+}
+
+// --- HELPER FUNCTIONS ---
+function getEmptyStats() {
+  return {
+    totalVisitors: 0,
+    newVisitors: 0,
+    returningVisitors: 0,
+    bounceRate: 0,
+    avgSessionDuration: 0,
+    pagesPerVisit: 0,
+    lastUpdated: new Date().toISOString(),
+    realData: false,
+    totalPageViews: 0,
+    totalSessions: 0,
+    exitPages: [],
+    trafficSources: [],
+    conversionFunnel: []
+  };
+}
+
+function isValidDomain(domain) {
+  const domainRegex = /^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/;
+  return domainRegex.test(domain);
+}
+
+function generateErrorId() {
+  return uuidv4().substring(0, 8);
+}
+
+function getStartDate(range) {
+  const now = new Date();
+  switch(range) {
+    case '24h': return new Date(now.getTime() - 24 * 60 * 60 * 1000);
+    case '7d': return new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+    case '30d': return new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+    default: return new Date(now.getTime() - 24 * 60 * 60 * 1000);
+  }
+}
+
+// --- SOCKET.IO HANDLERS ---
+io.on('connection', (socket) => {
+  console.log('🔌 Client connected:', socket.id);
+  
+  socket.on('subscribe-domain', (domain) => {
+    socket.join(domain);
+    console.log(`Client ${socket.id} subscribed to domain: ${domain}`);
+  });
+
+  socket.on('disconnect', () => {
+    console.log('🔌 Client disconnected:', socket.id);
+  });
+});
+
+// Emit real-time updates
+function emitStatsUpdate(domain, stats) {
+  io.to(domain).emit('stats-update', stats);
+}
+
 // --- MIDDLEWARE OPTIMIZATIONS ---
+app.use(cors({
+  origin: ['http://localhost:3000', 'http://localhost:5173','https://yourspaceanalytics.info','https://www.yourspaceanalytics.info'],
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-user-id'],
+  credentials: true
+}));
 app.use(helmet({
   contentSecurityPolicy: false,
   crossOriginEmbedderPolicy: false
@@ -81,18 +227,13 @@ app.use(compression());
 // --- TRIAL EXPIRATION MIDDLEWARE ---
 async function checkTrialExpiration(req, res, next) {
   try {
-    // Skip for auth-related endpoints and public endpoints
     const publicPaths = ['/api/health', '/track', '/tracker.js', '/api/paypal'];
     if (publicPaths.some(path => req.path.startsWith(path))) {
       return next();
     }
 
-    // Check if user is authenticated via header or query param
     const userId = req.headers['x-user-id'] || req.query.userId;
-
-    if (!userId) {
-      return next(); // Allow anonymous access for now
-    }
+    if (!userId) return next();
 
     if (supabase) {
       const { data: profile, error } = await supabase
@@ -121,24 +262,21 @@ async function checkTrialExpiration(req, res, next) {
     next();
   } catch (error) {
     console.error('Trial check middleware error:', error);
-    next(); // Continue on error to avoid blocking legitimate requests
+    next();
   }
 }
 
 app.use(checkTrialExpiration);
 
-// IMPROVED CORS CONFIGURATION - FIXED WILDCARD ISSUE
+// Enhanced CORS configuration
 app.use(cors({
   origin: function (origin, callback) {
-    // Allow requests with no origin (like mobile apps or curl requests)
     if (!origin) return callback(null, true);
     
     const allowedOrigins = [
       'http://localhost:3000', 
       'http://localhost:5173', 
       'https://localhost:3000',
-      // 'https://www.tiffad.co.ke',
-      // 'https://tiffad.co.ke',
       'https://www.gigatechshop.co.ke',
       'https://gigatechshop.co.ke',
       'https://www.yourspaceanalytics.info',
@@ -148,7 +286,6 @@ app.use(cors({
     if (allowedOrigins.indexOf(origin) !== -1) {
       callback(null, true);
     } else {
-      // For tracking purposes, allow any origin
       callback(null, true);
     }
   },
@@ -157,14 +294,14 @@ app.use(cors({
   allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'x-user-id']
 }));
 
-// Handle preflight requests for specific endpoints instead of using '*'
+// Handle preflight requests
 app.options('/track', cors());
 app.options('/api/stats/:domain', cors());
 app.options('/tracker.js', cors());
 
 app.use(express.json({ limit: '10kb' }));
 
-// Rate limiting - more generous for tracking
+// Rate limiting
 const trackLimiter = rateLimit({
   windowMs: 1 * 60 * 1000,
   max: 500,
@@ -177,7 +314,6 @@ const apiLimiter = rateLimit({
 });
 
 // --- DATABASE SETUP FUNCTIONS ---
-
 async function setupDatabase() {
   if (!supabase) {
     console.log('⚠️ Database setup skipped: Supabase client not available');
@@ -185,7 +321,6 @@ async function setupDatabase() {
   }
 
   try {
-    // Test connection by checking if table exists
     const { data, error } = await supabase
       .from('page_views')
       .select('count')
@@ -225,6 +360,11 @@ async function createTables() {
           language TEXT,
           timezone TEXT,
           event_type TEXT DEFAULT 'pageview',
+          time_on_page INTEGER,
+          session_id TEXT,
+          utm_source TEXT,
+          utm_medium TEXT,
+          utm_campaign TEXT,
           created_at TIMESTAMPTZ DEFAULT NOW()
         );
       `
@@ -255,6 +395,27 @@ async function createTables() {
       console.log('✅ websites table created or already exists');
     }
 
+    // Create profiles table for subscription management
+    const { error: profilesError } = await supabase.rpc('exec_sql', {
+      sql: `
+        CREATE TABLE IF NOT EXISTS profiles (
+          id UUID PRIMARY KEY,
+          plan TEXT DEFAULT 'free',
+          tracking_code TEXT,
+          subscription_id TEXT,
+          trial_ends_at TIMESTAMPTZ,
+          updated_at TIMESTAMPTZ DEFAULT NOW(),
+          created_at TIMESTAMPTZ DEFAULT NOW()
+        );
+      `
+    });
+
+    if (profilesError) {
+      console.error('Error creating profiles table:', profilesError);
+    } else {
+      console.log('✅ profiles table created or already exists');
+    }
+
     // Create indexes
     const { error: indexError1 } = await supabase.rpc('exec_sql', {
       sql: 'CREATE INDEX IF NOT EXISTS idx_page_views_site_id ON page_views(site_id);'
@@ -278,53 +439,637 @@ async function createTables() {
 
   } catch (error) {
     console.error('❌ Error in createTables:', error);
-    console.log('💡 Fallback: Please create the tables manually in Supabase SQL Editor:');
-    console.log(`
-      CREATE TABLE IF NOT EXISTS page_views (
-        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        site_id TEXT NOT NULL,
-        visitor_id TEXT NOT NULL,
-        path TEXT NOT NULL,
-        referrer TEXT,
-        screen_width INTEGER,
-        screen_height INTEGER,
-        language TEXT,
-        timezone TEXT,
-        event_type TEXT DEFAULT 'pageview',
-        created_at TIMESTAMPTZ DEFAULT NOW()
-      );
-
-      CREATE TABLE IF NOT EXISTS websites (
-        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        userId TEXT NOT NULL,
-        domain TEXT NOT NULL,
-        created_at TIMESTAMPTZ DEFAULT NOW(),
-        UNIQUE(userId, domain)
-      );
-
-      CREATE INDEX IF NOT EXISTS idx_page_views_site_id ON page_views(site_id);
-      CREATE INDEX IF NOT EXISTS idx_page_views_created_at ON page_views(created_at);
-      CREATE INDEX IF NOT EXISTS idx_websites_domain ON websites(domain);
-    `);
   }
 }
+
 setupDatabase();
 
-// --- REAL TRACKING ENDPOINT (FIXED CORS) ---
+// --- MATERIALIZED VIEWS FOR PERFORMANCE ---
+async function createMaterializedViews() {
+  if (!supabase) return;
+  
+  try {
+    await supabase.rpc('exec_sql', {
+      sql: `
+        CREATE MATERIALIZED VIEW IF NOT EXISTS daily_stats AS
+        SELECT 
+          site_id,
+          DATE(created_at) as date,
+          COUNT(DISTINCT visitor_id) as daily_visitors,
+          COUNT(*) as page_views
+        FROM page_views 
+        GROUP BY site_id, DATE(created_at);
+      `
+    });
+    console.log('✅ Materialized views created');
+  } catch (error) {
+    console.error('Error creating materialized views:', error);
+  }
+}
+
+// --- ENHANCED STATS CALCULATION WITH TRENDS ---
+async function calculateRealStats(pageViews, timeRange = '24h', domain = null) {
+  if (!pageViews || !Array.isArray(pageViews)) {
+    console.log('⚠️ calculateRealStats: pageViews is undefined or not an array');
+    return getEmptyStats();
+  }
+
+  if (pageViews.length === 0) {
+    return getEmptyStats();
+  }
+
+  const startTime = getStartDate(timeRange);
+  const filteredPageViews = pageViews.filter(pv => 
+    new Date(pv.created_at) >= startTime
+  );
+
+  if (filteredPageViews.length === 0) {
+    return getEmptyStats();
+  }
+
+  // Calculate previous period for trend comparison
+  const previousStartTime = getPreviousPeriodStart(timeRange);
+  const previousPageViews = pageViews.filter(pv => {
+    const createdAt = new Date(pv.created_at);
+    return createdAt >= previousStartTime && createdAt < startTime;
+  });
+
+  // Calculate current period stats
+  const currentStats = await calculatePeriodStats(filteredPageViews, domain, startTime);
+  
+  // Calculate previous period stats for trends
+  const previousStats = previousPageViews.length > 0 
+    ? await calculatePeriodStats(previousPageViews, domain, previousStartTime)
+    : null;
+
+  // Calculate trends
+  const trends = calculateTrends(currentStats, previousStats);
+
+  return {
+    ...currentStats,
+    trends,
+    lastUpdated: new Date().toISOString(),
+    realData: true
+  };
+}
+
+// Helper function to calculate start of previous period
+function getPreviousPeriodStart(timeRange) {
+  const now = new Date();
+  switch(timeRange) {
+    case '24h':
+      return new Date(now.getTime() - 48 * 60 * 60 * 1000); // 48 hours ago
+    case '7d':
+      return new Date(now.getTime() - 14 * 24 * 60 * 60 * 1000); // 14 days ago
+    case '30d':
+      return new Date(now.getTime() - 60 * 24 * 60 * 60 * 1000); // 60 days ago
+    default:
+      return new Date(now.getTime() - 48 * 60 * 60 * 1000);
+  }
+}
+
+// Extract the stats calculation into a reusable function
+async function calculatePeriodStats(pageViews, domain, periodStartTime) {
+  const visitors = new Set();
+  const sessions = new Map();
+  const visitorEvents = {};
+  const visitorFirstSeen = {};
+
+  // Process page views and calculate sessions
+  pageViews.forEach(pv => {
+    const visitorId = pv.visitor_id;
+    const visitTime = new Date(pv.created_at);
+    
+    visitors.add(visitorId);
+    
+    if (!visitorFirstSeen[visitorId] || visitTime < visitorFirstSeen[visitorId]) {
+      visitorFirstSeen[visitorId] = visitTime;
+    }
+
+    if (!visitorEvents[visitorId]) {
+      visitorEvents[visitorId] = [];
+    }
+    visitorEvents[visitorId].push({
+      ...pv,
+      timestamp: visitTime
+    });
+
+    if (!sessions.has(visitorId)) {
+      sessions.set(visitorId, []);
+    }
+
+    const visitorSessions = sessions.get(visitorId);
+    let sessionFound = false;
+
+    for (let session of visitorSessions) {
+      const lastEventTime = new Date(session.events[session.events.length - 1].created_at);
+      const timeDiff = (visitTime - lastEventTime) / (1000 * 60);
+
+      if (timeDiff <= 30) {
+        session.events.push(pv);
+        session.endTime = visitTime;
+        sessionFound = true;
+        break;
+      }
+    }
+
+    if (!sessionFound) {
+      visitorSessions.push({
+        startTime: visitTime,
+        endTime: visitTime,
+        events: [pv],
+        sessionId: `${visitorId}-${visitTime.getTime()}`
+      });
+    }
+  });
+
+  // Calculate total sessions
+  let totalSessions = 0;
+  sessions.forEach(visitorSessions => {
+    totalSessions += visitorSessions.length;
+  });
+
+  // Calculate bounce rate (sessions with only one pageview)
+  let bounceSessions = 0;
+  sessions.forEach(visitorSessions => {
+    visitorSessions.forEach(session => {
+      if (session.events.length === 1) {
+        bounceSessions++;
+      }
+    });
+  });
+
+  const bounceRate = totalSessions > 0 ? (bounceSessions / totalSessions) * 100 : 0;
+
+  // Calculate average session duration
+  let totalSessionDuration = 0;
+  let sessionsWithDuration = 0;
+
+  sessions.forEach(visitorSessions => {
+    visitorSessions.forEach(session => {
+      if (session.events.length > 1) {
+        const duration = (session.endTime - session.startTime) / 1000;
+        totalSessionDuration += duration;
+        sessionsWithDuration++;
+      }
+    });
+  });
+
+  const avgSessionDuration = sessionsWithDuration > 0 ? 
+    Math.round(totalSessionDuration / sessionsWithDuration) : 0;
+
+  // Calculate returning visitors (visited before the period)
+  let returningVisitors = 0;
+  let historicalVisitors = new Set();
+
+  if (supabase) {
+    try {
+      const { data: historicalData, error: histError } = await supabase
+        .from('page_views')
+        .select('visitor_id')
+        .eq('site_id', domain)
+        .lt('created_at', periodStartTime.toISOString());
+
+      if (!histError && historicalData) {
+        historicalData.forEach(pv => {
+          if (pv.visitor_id) {
+            historicalVisitors.add(pv.visitor_id);
+          }
+        });
+      }
+    } catch (error) {
+      console.error('Error fetching historical visitors:', error);
+    }
+  }
+
+  visitors.forEach(visitorId => {
+    if (historicalVisitors.has(visitorId)) {
+      returningVisitors++;
+    }
+  });
+
+  const totalVisitors = visitors.size;
+  const newVisitors = totalVisitors - returningVisitors;
+
+  // Calculate pages per visit
+  const pagesPerVisit = totalSessions > 0 ? 
+    parseFloat((pageViews.length / totalSessions).toFixed(1)) : 0;
+
+  return {
+    totalVisitors,
+    newVisitors,
+    returningVisitors,
+    bounceRate: parseFloat(bounceRate.toFixed(1)),
+    avgSessionDuration,
+    pagesPerVisit,
+    totalPageViews: pageViews.length,
+    totalSessions
+  };
+}
+
+// Trend calculation function
+function calculateTrends(currentStats, previousStats) {
+  if (!previousStats) {
+    // If no previous data, return neutral trends
+    return {
+      bounceRate: 0,
+      avgSessionDuration: 0,
+      pagesPerVisit: 0,
+      totalVisitors: 0,
+      newVisitors: 0,
+      returningVisitors: 0
+    };
+  }
+
+  // Helper function to calculate percentage change safely
+  const calculateChange = (current, previous) => {
+    if (previous === 0) {
+      return current > 0 ? 100 : 0; // If no previous data but current exists, show 100% growth
+    }
+    return ((current - previous) / previous) * 100;
+  };
+
+  return {
+    bounceRate: parseFloat(calculateChange(currentStats.bounceRate, previousStats.bounceRate).toFixed(1)),
+    avgSessionDuration: parseFloat(calculateChange(currentStats.avgSessionDuration, previousStats.avgSessionDuration).toFixed(1)),
+    pagesPerVisit: parseFloat(calculateChange(currentStats.pagesPerVisit, previousStats.pagesPerVisit).toFixed(1)),
+    totalVisitors: parseFloat(calculateChange(currentStats.totalVisitors, previousStats.totalVisitors).toFixed(1)),
+    newVisitors: parseFloat(calculateChange(currentStats.newVisitors, previousStats.newVisitors).toFixed(1)),
+    returningVisitors: parseFloat(calculateChange(currentStats.returningVisitors, previousStats.returningVisitors).toFixed(1))
+  };
+}
+// --- EXIT PAGES CALCULATION ---
+function calculateExitPages(pageViews) {
+  if (!pageViews || pageViews.length === 0) return [];
+
+  const pageStats = {};
+  const visitorPages = {};
+
+  // Group by visitor to find exit pages
+  pageViews.forEach(pv => {
+    if (!visitorPages[pv.visitor_id]) {
+      visitorPages[pv.visitor_id] = [];
+    }
+    visitorPages[pv.visitor_id].push(pv);
+  });
+
+  // Find exit pages for each visitor
+  Object.values(visitorPages).forEach(pages => {
+    pages.sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime());
+    const lastPage = pages[pages.length - 1];
+    if (!pageStats[lastPage.path]) {
+      pageStats[lastPage.path] = { visits: 0, exits: 0, totalTime: 0 };
+    }
+    pageStats[lastPage.path].exits++;
+  });
+
+  // Count total visits per page
+  pageViews.forEach(pv => {
+    if (!pageStats[pv.path]) {
+      pageStats[pv.path] = { visits: 0, exits: 0, totalTime: 0 };
+    }
+    pageStats[pv.path].visits++;
+    pageStats[pv.path].totalTime += pv.time_on_page || 0;
+  });
+
+  return Object.entries(pageStats)
+    .map(([url, stats]) => ({
+      url,
+      exitRate: parseFloat(((stats.exits / stats.visits) * 100).toFixed(1)),
+      visits: stats.visits,
+      avgTimeOnPage: Math.round(stats.totalTime / stats.visits) || 0
+    }))
+    .sort((a, b) => b.exitRate - a.exitRate)
+    .slice(0, 10);
+}
+
+// --- TRAFFIC SOURCES CALCULATION ---
+function calculateTrafficSources(pageViews) {
+  if (!pageViews || pageViews.length === 0) return [];
+
+  const sourceStats = {};
+
+  pageViews.forEach(pv => {
+    const source = pv.utm_source || pv.referrer || 'direct';
+    if (!sourceStats[source]) {
+      sourceStats[source] = { visitors: new Set(), bounces: new Set(), conversions: 0 };
+    }
+    
+    sourceStats[source].visitors.add(pv.visitor_id);
+    
+    // Simplified bounce detection (single page visit)
+    const visitorPages = pageViews.filter(page => page.visitor_id === pv.visitor_id);
+    if (visitorPages.length === 1) {
+      sourceStats[source].bounces.add(pv.visitor_id);
+    }
+  });
+
+  return Object.entries(sourceStats).map(([source, stats]) => {
+    const totalVisitors = stats.visitors.size;
+    const bounceRate = totalVisitors > 0 ? (stats.bounces.size / totalVisitors) * 100 : 0;
+    
+    return {
+      source: source === 'direct' ? 'Direct' : formatSource(source),
+      visitors: totalVisitors,
+      bounceRate: parseFloat(bounceRate.toFixed(1)),
+      conversionRate: 2.5, // Simplified for now
+      cost: getEstimatedCost(source),
+      revenue: getEstimatedRevenue(source, totalVisitors)
+    };
+  }).sort((a, b) => b.visitors - a.visitors);
+}
+
+function formatSource(source) {
+  if (source.includes('google')) return 'Google';
+  if (source.includes('facebook')) return 'Facebook';
+  if (source.includes('instagram')) return 'Instagram';
+  if (source.includes('twitter')) return 'Twitter';
+  if (source.includes('linkedin')) return 'LinkedIn';
+  if (source === 'direct') return 'Direct';
+  
+  try {
+    if (source.startsWith('http')) {
+      const url = new URL(source);
+      return url.hostname.replace('www.', '');
+    }
+  } catch (e) {
+    // If it's not a valid URL, return as is
+  }
+  
+  return source;
+}
+
+function getEstimatedCost(source) {
+  const costs = {
+    'Google': 500,
+    'Facebook': 300,
+    'Instagram': 200,
+    'Twitter': 150,
+    'LinkedIn': 400,
+    'Direct': 0
+  };
+  return costs[source] || 100;
+}
+
+function getEstimatedRevenue(source, visitors) {
+  const conversionRates = {
+    'Google': 0.04,
+    'Facebook': 0.03,
+    'Instagram': 0.025,
+    'Twitter': 0.02,
+    'LinkedIn': 0.05,
+    'Direct': 0.06
+  };
+  
+  const avgOrderValue = 89;
+  const conversionRate = conversionRates[source] || 0.02;
+  return Math.round(visitors * conversionRate * avgOrderValue);
+}
+
+// --- CONVERSION FUNNEL CALCULATION ---
+function calculateConversionFunnel(pageViews) {
+  if (!pageViews || pageViews.length === 0) return [];
+
+  const stages = [
+    { stage: 'view-product', pattern: /product|item|shop|store/ },
+    { stage: 'add-to-cart', pattern: /cart|basket|add/ },
+    { stage: 'checkout', pattern: /checkout|payment|billing/ },
+    { stage: 'purchase', pattern: /success|thank-you|confirmation/ }
+  ];
+
+  const stageVisitors = {};
+  stages.forEach(stage => stageVisitors[stage.stage] = new Set());
+
+  // Assign visitors to stages based on visited pages
+  pageViews.forEach(pv => {
+    stages.forEach(({ stage, pattern }) => {
+      if (pattern.test(pv.path.toLowerCase())) {
+        stageVisitors[stage].add(pv.visitor_id);
+      }
+    });
+  });
+
+  const funnel = [];
+  let previousVisitors = 0;
+
+  stages.forEach((stage, index) => {
+    const visitors = stageVisitors[stage.stage].size;
+    const dropOffCount = index === 0 ? 0 : previousVisitors - visitors;
+    const dropOffRate = index === 0 ? 0 : parseFloat(((dropOffCount / previousVisitors) * 100).toFixed(1));
+
+    funnel.push({
+      stage: stage.stage,
+      visitors,
+      dropOffCount,
+      dropOffRate
+    });
+
+    previousVisitors = visitors;
+  });
+
+  return funnel;
+}
+
+// --- TIME SERIES DATA FOR CHARTS ---
+async function getTimeSeriesData(domain, range) {
+  if (!supabase) return [];
+
+  try {
+    const { data } = await supabase
+      .from('page_views')
+      .select('created_at, visitor_id')
+      .eq('site_id', domain)
+      .gte('created_at', getStartDate(range))
+      .order('created_at', { ascending: true });
+    
+    return groupDataByTime(data || [], range);
+  } catch (error) {
+    console.error('Error fetching time series data:', error);
+    return [];
+  }
+}
+
+function groupDataByTime(data, range) {
+  const groupedData = {};
+  
+  data.forEach(item => {
+    const date = new Date(item.created_at);
+    let timeKey;
+    
+    switch(range) {
+      case '24h':
+        timeKey = date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        break;
+      case '7d':
+        timeKey = date.toLocaleDateString('en-US', { weekday: 'short' });
+        break;
+      case '30d':
+        timeKey = `Week ${Math.ceil(date.getDate() / 7)}`;
+        break;
+      default:
+        timeKey = date.toLocaleDateString();
+    }
+    
+    if (!groupedData[timeKey]) {
+      groupedData[timeKey] = { visitors: new Set(), count: 0 };
+    }
+    
+    groupedData[timeKey].visitors.add(item.visitor_id);
+    groupedData[timeKey].count++;
+  });
+
+  return Object.entries(groupedData).map(([time, stats]) => ({
+    time,
+    visitors: stats.visitors.size,
+    pageViews: stats.count,
+    timestamp: new Date().getTime() // Simplified, should be actual timestamp
+  }));
+}
+
+// --- VALIDATION MIDDLEWARE ---
+const validateStatsRequest = (req, res, next) => {
+  const { domain } = req.params;
+  
+  if (!domain || domain.length > 255) {
+    return res.status(400).json({ error: 'Invalid domain parameter' });
+  }
+  
+  if (!isValidDomain(domain)) {
+    return res.status(400).json({ error: 'Invalid domain format' });
+  }
+  
+  next();
+};
+
+// --- AI ANALYSIS FUNCTIONS ---
+async function analyzePageWithAI(page, domain) {
+  try {
+    const model = ai.getGenerativeModel({ model: 'gemini-1.5-flash' });
+    
+    const prompt = `
+Analyze this webpage's performance data and provide specific recommendations:
+
+Page URL: ${page.url}
+Domain: ${domain}
+Performance Metrics:
+- Exit Rate: ${page.exitRate}%
+- Visits: ${page.visits}
+- Average Time on Page: ${page.avgTimeOnPage} seconds
+
+Based on these metrics and typical web performance standards, provide:
+1. Severity assessment (high/medium/low)
+2. 3-5 specific suggestions to improve retention
+3. Performance issues to address
+4. Security concerns if any
+5. SEO recommendations
+
+Return as JSON with this exact structure:
+{
+  "severity": "high|medium|low",
+  "suggestions": ["suggestion1", "suggestion2", ...],
+  "performanceIssues": ["issue1", "issue2", ...],
+  "securityConcerns": ["concern1", "concern2", ...],
+  "seoRecommendations": ["rec1", "rec2", ...]
+}
+`;
+
+    const result = await model.generateContent(prompt);
+    const response = await result.response;
+    const text = response.text();
+    
+    const jsonMatch = text.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      return JSON.parse(jsonMatch[0]);
+    }
+    
+    throw new Error('Invalid AI response format');
+  } catch (error) {
+    console.error('AI page analysis failed:', error);
+    // Return fallback analysis
+    return {
+      severity: page.exitRate > 70 ? 'high' : page.exitRate > 40 ? 'medium' : 'low',
+      suggestions: ['Improve page content relevance', 'Add clear call-to-action buttons'],
+      performanceIssues: [],
+      securityConcerns: [],
+      seoRecommendations: ['Optimize meta tags', 'Improve page loading speed']
+    };
+  }
+}
+
+// --- WEBSITE CONTENT FETCHING ---
+async function fetchWebsiteContent(domain) {
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 10000);
+
+    let response = await fetch(`https://${domain}`, {
+      signal: controller.signal,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (compatible; WebTrafficInsightAI/1.0)'
+      }
+    });
+
+    clearTimeout(timeoutId);
+
+    if (!response.ok && response.status !== 200) {
+      const controller2 = new AbortController();
+      const timeoutId2 = setTimeout(() => controller2.abort(), 10000);
+
+      response = await fetch(`http://${domain}`, {
+        signal: controller2.signal,
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (compatible; WebTrafficInsightAI/1.0)'
+        }
+      });
+
+      clearTimeout(timeoutId2);
+    }
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+    }
+
+    const contentType = response.headers.get('content-type');
+    if (!contentType || !contentType.includes('text/html')) {
+      throw new Error(`Expected HTML but got ${contentType}`);
+    }
+
+    const html = await response.text();
+    return html.substring(0, 50000);
+  } catch (error) {
+    if (error.name === 'AbortError') {
+      console.error(`Timeout fetching website content for ${domain}`);
+    } else {
+      console.error(`Error fetching website content for ${domain}:`, error.message);
+    }
+    return null;
+  }
+}
+
+// --- AI PROMPT CACHE ---
+const aiPromptCache = new NodeCache({ stdTTL: 600 });
+
+// --- ENDPOINTS ---
+
+// --- REAL TRACKING ENDPOINT ---
 app.post('/track', trackLimiter, async (req, res) => {
-  // Let the CORS middleware handle headers - REMOVE manual CORS headers
   console.log('📨 Received tracking request:', req.body?.siteId, req.body?.path);
 
-  const { 
-    siteId, 
-    visitorId, 
-    path, 
-    referrer, 
-    screenWidth, 
-    screenHeight, 
-    language, 
+  const {
+    siteId,
+    visitorId,
+    path,
+    referrer,
+    screenWidth,
+    screenHeight,
+    language,
     timezone,
     eventType = 'pageview',
+    timeOnPage,
+    sessionId,
+    utmSource,
+    utmMedium,
+    utmCampaign,
     timestamp = Date.now()
   } = req.body;
   
@@ -333,9 +1078,7 @@ app.post('/track', trackLimiter, async (req, res) => {
   }
 
   try {
-    // Store the tracking event in Supabase if available
     if (supabase) {
-      // Insert or update the website in the websites table for the user
       const userId = req.headers['x-user-id'] || req.query.userId || null;
       if (userId) {
         try {
@@ -361,34 +1104,25 @@ app.post('/track', trackLimiter, async (req, res) => {
             language: language,
             timezone: timezone,
             event_type: eventType,
+            time_on_page: timeOnPage,
+            session_id: sessionId,
+            utm_source: utmSource,
+            utm_medium: utmMedium,
+            utm_campaign: utmCampaign,
             created_at: new Date(timestamp).toISOString()
           }
         ])
         .select();
 
       if (error) {
-        console.error('Database insert error:', {
-          message: error.message,
-          details: error.details,
-          hint: error.hint,
-          code: error.code
-        });
-        // Continue to log the event even if DB fails
+        console.error('Database insert error:', error);
       } else {
-        console.log('✅ Tracked event in DB:', {
-          siteId,
-          visitorId,
-          path: path || '/',
-          eventType
-        });
+        console.log('✅ Tracked event in DB:', { siteId, visitorId, path: path || '/', eventType });
+        // Emit real-time update
+        emitStatsUpdate(siteId, { event: 'new_pageview', path: path || '/' });
       }
     } else {
-      console.log('📝 Tracked event (no DB):', { 
-        siteId, 
-        visitorId, 
-        path: path || '/', 
-        eventType
-      });
+      console.log('📝 Tracked event (no DB):', { siteId, visitorId, path: path || '/', eventType });
     }
     
     res.status(204).send();
@@ -398,101 +1132,11 @@ app.post('/track', trackLimiter, async (req, res) => {
   }
 });
 
-// --- HELPER FUNCTIONS (FIXED STATS ERROR) ---
-
-function getEmptyStats() {
-  return {
-    totalVisitors: 0,
-    newVisitors: 0,
-    returningVisitors: 0,
-    bounceRate: 0,
-    avgSessionDuration: 0,
-    pagesPerVisit: 0,
-    lastUpdated: new Date().toISOString(),
-    realData: false,
-    totalPageViews: 0,
-    totalSessions: 0
-  };
-}
-
-// FIXED: Added proper error handling for undefined pageViews
-function calculateRealStats(pageViews) {
-  // FIX: Check if pageViews is undefined or not an array
-  if (!pageViews || !Array.isArray(pageViews)) {
-    console.log('⚠️ calculateRealStats: pageViews is undefined or not an array');
-    return getEmptyStats();
-  }
-
-  if (pageViews.length === 0) {
-    return getEmptyStats();
-  }
-
-  const visitors = new Set(pageViews.map(pv => pv.visitor_id));
-  const sessions = new Set();
-
-  // Group by visitor and calculate sessions
-  const visitorEvents = {};
-  pageViews.forEach(pv => {
-    if (!visitorEvents[pv.visitor_id]) {
-      visitorEvents[pv.visitor_id] = [];
-    }
-    visitorEvents[pv.visitor_id].push(pv);
-  });
-
-  // Calculate sessions (visits with same visitor_id within 30 minutes)
-  Object.values(visitorEvents).forEach(events => {
-    events.sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
-
-    let sessionStart = new Date(events[0].created_at);
-    let sessionId = `${events[0].visitor_id}-${sessionStart.getTime()}`;
-    sessions.add(sessionId);
-
-    for (let i = 1; i < events.length; i++) {
-      const currentTime = new Date(events[i].created_at);
-      const timeDiff = (currentTime - sessionStart) / (1000 * 60); // minutes
-
-      if (timeDiff > 30) {
-        // New session
-        sessionStart = currentTime;
-        sessionId = `${events[i].visitor_id}-${sessionStart.getTime()}`;
-        sessions.add(sessionId);
-      }
-    }
-  });
-
-  // Calculate bounce rate (single page sessions)
-  const singlePageSessions = Array.from(sessions).filter(sessionId => {
-    const visitorId = sessionId.split('-')[0];
-    return visitorEvents[visitorId] && visitorEvents[visitorId].length === 1;
-  });
-
-  const totalVisitors = visitors.size;
-  const totalSessions = sessions.size;
-  const bounceRate = totalSessions > 0 ? (singlePageSessions.length / totalSessions) * 100 : 0;
-
-  // FIX: Use optional chaining and proper fallbacks
-  return {
-    totalVisitors: totalVisitors,
-    newVisitors: totalVisitors, // Simplified: all are new for now
-    returningVisitors: 0, // Simplified
-    bounceRate: parseFloat(bounceRate.toFixed(1)),
-    avgSessionDuration: 120, // Simplified placeholder
-    pagesPerVisit: parseFloat((pageViews?.length / totalSessions).toFixed(1)) || 0,
-    lastUpdated: new Date().toISOString(),
-    realData: true,
-    totalPageViews: pageViews?.length || 0, // FIX: Added fallback
-    totalSessions: totalSessions
-  };
-}
-
-// --- REAL STATS ENDPOINT (FIXED UNDEFINED ERROR) ---
-app.get('/api/stats/:domain', apiLimiter, async (req, res) => {
+// --- ENHANCED STATS ENDPOINT ---
+app.get('/api/stats/:domain', validateStatsRequest, apiLimiter, async (req, res) => {
   const { domain } = req.params;
   const userId = req.headers['x-user-id'] || req.query.userId;
-
-  if (!domain || domain.length > 255) {
-    return res.status(400).json({ error: 'Invalid domain parameter' });
-  }
+  const timeRange = req.query.range || '24h';
 
   if (!userId) {
     return res.status(400).json({ error: 'User ID is required' });
@@ -517,231 +1161,194 @@ app.get('/api/stats/:domain', apiLimiter, async (req, res) => {
     }
   }
 
-  const cacheKey = `stats:${domain}`;
+  const cacheKey = `stats:${domain}:${timeRange}`;
   const cachedStats = statsCache.get(cacheKey);
 
-  // Only use cache if it's very fresh (10 seconds)
-  if (cachedStats && (Date.now() - new Date(cachedStats.lastUpdated).getTime()) < 10000) {
+  if (cachedStats && (Date.now() - new Date(cachedStats.lastUpdated).getTime()) < 30000) {
     return res.json(cachedStats);
   }
 
   try {
     let pageViews = [];
 
-    // Only query database if supabase is available
     if (supabase) {
+      const startDate = getStartDate(timeRange);
       const { data, error } = await supabase
         .from('page_views')
         .select('*')
         .eq('site_id', domain)
-        .gte('created_at', new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString());
+        .gte('created_at', startDate.toISOString())
+        .order('created_at', { ascending: true });
 
       if (error) {
         console.error('Database query error:', error.message);
-        // FIX: Ensure pageViews is always an array even on error
         pageViews = [];
       } else {
-        // FIX: Added proper fallback
         pageViews = data || [];
       }
     }
 
-    // Calculate real statistics
-    const stats = calculateRealStats(pageViews);
+    // Calculate all statistics
+    const stats = await calculateRealStats(pageViews, timeRange, domain);
+    const exitPages = calculateExitPages(pageViews);
+    const trafficSources = calculateTrafficSources(pageViews);
+    const conversionFunnel = calculateConversionFunnel(pageViews);
 
-    console.log('📊 Stats for:', domain, 'user:', userId, {
+    const fullStats = {
+      ...stats,
+      exitPages,
+      trafficSources,
+      conversionFunnel
+    };
+
+    console.log('📊 Stats for:', domain, 'range:', timeRange, 'user:', userId, {
       totalVisitors: stats.totalVisitors,
       totalPageViews: stats.totalPageViews,
+      bounceRate: stats.bounceRate,
       realData: stats.realData
     });
 
-    // Cache for only 10 seconds for near real-time updates
-    statsCache.set(cacheKey, stats, 10);
-
-    res.json(stats);
+    statsCache.set(cacheKey, fullStats, 30);
+    res.json(fullStats);
 
   } catch (error) {
     console.error(`Error fetching stats for ${domain}:`, error.message);
-    // FIX: Return proper empty stats instead of letting it crash
     const emptyStats = getEmptyStats();
     emptyStats.message = "No tracking data yet. Add the tracker to your website.";
     res.json(emptyStats);
   }
 });
 
-// --- DEBUG ENDPOINT: Check tracking data ---
-app.get('/api/debug/:domain', apiLimiter, async (req, res) => {
+// --- CHART DATA ENDPOINT ---
+app.get('/api/chart-data/:domain', apiLimiter, async (req, res) => {
   const { domain } = req.params;
+  const { range = '7d' } = req.query;
   
   try {
-    let pageViews = [];
-    let dbStatus = 'disconnected';
-    
-    if (supabase) {
-      const { data, error } = await supabase
-        .from('page_views')
-        .select('*')
-        .eq('site_id', domain)
-        .order('created_at', { ascending: false })
-        .limit(20);
+    const chartData = await getTimeSeriesData(domain, range);
+    res.json(chartData);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch chart data' });
+  }
+});
 
-      if (!error) {
-        pageViews = data || [];
-        dbStatus = 'connected';
-      } else {
-        console.error('Debug endpoint database error:', error);
+// --- RECENT VISITORS ENDPOINT ---
+// Replace your existing recent-visitors endpoint with this:
+app.get('/api/recent-visitors/:domain', apiLimiter, async (req, res) => {
+  const { domain } = req.params;
+  const { limit = 50 } = req.query;
+  const userId = req.headers['x-user-id'] || req.query.userId;
+
+  console.log('📊 Recent visitors request:', { domain, limit, userId });
+
+  // Validate user ownership
+  if (supabase && userId) {
+    try {
+      const { data: website, error: ownershipError } = await supabase
+        .from('websites')
+        .select('id')
+        .eq('userId', userId)
+        .eq('domain', domain)
+        .single();
+
+      if (ownershipError || !website) {
+        return res.status(403).json({ 
+          error: 'Access denied: You do not own this website',
+          data: []
+        });
       }
+    } catch (error) {
+      console.error('Ownership check error:', error);
+      return res.status(500).json({ 
+        error: 'Could not verify website ownership',
+        data: []
+      });
+    }
+  }
+
+  if (!supabase) {
+    return res.json([]); // Return empty array if no database
+  }
+
+  try {
+    const { data, error } = await supabase
+      .from('page_views')
+      .select('*')
+      .eq('site_id', domain)
+      .order('created_at', { ascending: false })
+      .limit(parseInt(limit));
+
+    if (error) {
+      console.error('Database query error:', error);
+      return res.status(500).json({ 
+        error: 'Database error: ' + error.message,
+        data: []
+      });
     }
 
-    res.json({
-      domain,
-      database: dbStatus,
-      totalRecords: pageViews.length,
-      sampleRecords: pageViews.slice(0, 5),
-      allVisitors: [...new Set(pageViews.map(pv => pv.visitor_id))],
-      supabaseConfigured: !!supabase
-    });
+    console.log('✅ Returning visitors:', data?.length || 0);
+    res.json(data || []);
 
   } catch (error) {
-    console.error('Debug endpoint error:', error);
+    console.error('Recent visitors endpoint error:', error);
     res.status(500).json({ 
-      error: error.message,
-      supabaseConfigured: !!supabase
+      error: 'Internal server error: ' + error.message,
+      data: []
     });
   }
 });
 
-// --- SERVE TRACKER SCRIPT (IMPROVED) ---
-app.get('/tracker.js', (req, res) => {
-  // Set proper CORS headers for the tracker script
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
-  res.setHeader('Vary', 'Origin');
-
-  const trackerScript = `
-(function() {
-  'use strict';
-
-  const config = {
-    backendUrl: 'https://${req.get('host')}',
-    trackEngagement: true,
-    trackPageExit: true
-  };
-
-  // Don't run in iframes
-  if (window.self !== window.top) {
-    return;
-  }
-
-  const script = document.currentScript;
-  const siteId = script?.getAttribute('data-site-id');
-
-  if (!siteId) {
-    console.error('Insight AI: Missing data-site-id attribute.');
-    return;
-  }
-
-  // Generate or retrieve visitor ID
-  let visitorId = localStorage.getItem('insight_ai_visitor_id');
-  if (!visitorId) {
-    visitorId = 'v2-' + Math.random().toString(36).substr(2, 9) + Date.now().toString(36);
-    try {
-      localStorage.setItem('insight_ai_visitor_id', visitorId);
-    } catch (e) {
-      sessionStorage.setItem('insight_ai_visitor_id', visitorId);
+app.post('/api/ai/traffic-source-analysis', apiLimiter, async (req, res) => {
+  try {
+    const { source, domain, timeRange } = req.body;
+    if (!source || !domain) {
+      return res.status(400).json({ error: 'Source and domain are required' });
     }
-  }
 
-  // Collect page data
-  const pageData = {
-    siteId: siteId,
-    visitorId: visitorId,
-    path: window.location.pathname,
-    referrer: document.referrer,
-    screenWidth: screen.width,
-    screenHeight: screen.height,
-    language: navigator.language,
-    timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
-    userAgent: navigator.userAgent,
-    timestamp: Date.now()
-  };
+    // Implement traffic source analysis with Gemini
+    const model = ai.getGenerativeModel({ model: 'gemini-1.5-flash' });
+    
+    const prompt = `
+Analyze this traffic source performance:
 
-  // Send tracking data
-  function sendTracking(eventType = 'pageview', customData = {}) {
-    const trackingData = { ...pageData, ...customData, eventType };
+Source: ${source.source}
+Domain: ${domain}
+Time Range: ${timeRange}
+Metrics:
+- Visitors: ${source.visitors}
+- Bounce Rate: ${source.bounceRate}%
+- Conversion Rate: ${source.conversionRate}%
+- Cost: $${source.cost || 'N/A'}
+- Revenue: $${source.revenue || 'N/A'}
 
-    if (navigator.sendBeacon) {
-      const blob = new Blob([JSON.stringify(trackingData)], { type: 'application/json' });
-      navigator.sendBeacon(config.backendUrl + '/track', blob);
-    } else {
-      fetch(config.backendUrl + '/track', {
-        method: 'POST',
-        body: JSON.stringify(trackingData),
-        headers: { 'Content-Type': 'application/json' },
-        keepalive: true,
-        mode: 'no-cors' // Fallback for CORS issues
-      }).catch(() => {});
+Provide performance analysis including:
+1. Performance rating (excellent/good/fair/poor)
+2. Budget allocation recommendation
+3. Industry comparison
+4. Optimization tips
+5. Risk factors
+6. Opportunity areas
+
+Return as structured JSON.
+`;
+
+    const result = await model.generateContent(prompt);
+    const response = await result.response;
+    const text = response.text();
+    
+    const jsonMatch = text.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      return res.json(JSON.parse(jsonMatch[0]));
     }
+    
+    throw new Error('Invalid AI response format');
+  } catch (error) {
+    console.error('AI traffic source analysis error:', error);
+    res.status(500).json({ error: 'AI analysis failed' });
   }
-
-  // Track initial page view
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', () => sendTracking('pageview'));
-  } else {
-    setTimeout(() => sendTracking('pageview'), 100);
-  }
-
-  // Track page exit
-  if (config.trackPageExit) {
-    window.addEventListener('beforeunload', function() {
-      sendTracking('pageexit', { exitTime: Date.now() });
-    });
-  }
-
-  // Track user engagement
-  if (config.trackEngagement) {
-    let engaged = false;
-    const engagementEvents = ['click', 'scroll', 'keydown', 'mousemove'];
-
-    engagementEvents.forEach(event => {
-      document.addEventListener(event, function() {
-        if (!engaged) {
-          engaged = true;
-          sendTracking('engagement', { engagementTime: Date.now() });
-        }
-      }, { once: true, passive: true });
-    });
-  }
-
-  // Expose global function for custom events
-  window.insightAI = window.insightAI || {};
-  window.insightAI.track = function(eventName, customData = {}) {
-    sendTracking(eventName, customData);
-  };
-
-  console.log('✅ Insight AI Tracker Loaded for site:', siteId);
-})();
-  `;
-
-  res.setHeader('Content-Type', 'application/javascript');
-  res.setHeader('Cache-Control', 'public, max-age=3600');
-  res.send(trackerScript);
 });
 
-// --- HEALTH CHECK ENDPOINT ---
-app.get('/api/health', (req, res) => {
-  res.status(200).json({ 
-    status: 'OK', 
-    timestamp: new Date().toISOString(),
-    uptime: process.uptime(),
-    tracking: 'active',
-    database: supabase ? 'connected' : 'disconnected'
-  });
-});
-
-// --- AI ENDPOINTS ---
-const aiPromptCache = new NodeCache({ stdTTL: 600 });
-
+// --- EXISTING AI ENDPOINTS ---
 app.post('/api/suggestions', apiLimiter, async (req, res) => {
   try {
     const { trafficData, domain } = req.body;
@@ -808,61 +1415,6 @@ app.post('/api/summary', apiLimiter, async (req, res) => {
   }
 });
 
-// --- HELPER FUNCTION TO FETCH WEBSITE CONTENT ---
-async function fetchWebsiteContent(domain) {
-  try {
-    // Create AbortController for timeout
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 10000); // 10 second timeout
-
-    // Try HTTPS first
-    let response = await fetch(`https://${domain}`, {
-      signal: controller.signal,
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (compatible; WebTrafficInsightAI/1.0)'
-      }
-    });
-
-    clearTimeout(timeoutId);
-
-    // If HTTPS fails, try HTTP
-    if (!response.ok && response.status !== 200) {
-      const controller2 = new AbortController();
-      const timeoutId2 = setTimeout(() => controller2.abort(), 10000);
-
-      response = await fetch(`http://${domain}`, {
-        signal: controller2.signal,
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (compatible; WebTrafficInsightAI/1.0)'
-        }
-      });
-
-      clearTimeout(timeoutId2);
-    }
-
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-    }
-
-    const contentType = response.headers.get('content-type');
-    if (!contentType || !contentType.includes('text/html')) {
-      throw new Error(`Expected HTML but got ${contentType}`);
-    }
-
-    const html = await response.text();
-    return html.substring(0, 50000); // Limit to first 50k chars to avoid token limits
-
-  } catch (error) {
-    if (error.name === 'AbortError') {
-      console.error(`Timeout fetching website content for ${domain}`);
-    } else {
-      console.error(`Error fetching website content for ${domain}:`, error.message);
-    }
-    return null;
-  }
-}
-
-// --- IMPROVEMENTS ENDPOINT ---
 app.post('/api/improvements', apiLimiter, async (req, res) => {
   try {
     const { trafficData, domain } = req.body;
@@ -883,7 +1435,6 @@ app.post('/api/improvements', apiLimiter, async (req, res) => {
       return res.json(cachedResult);
     }
 
-    // Fetch website content
     const websiteContent = await fetchWebsiteContent(domain);
 
     if (!websiteContent) {
@@ -897,11 +1448,10 @@ app.post('/api/improvements', apiLimiter, async (req, res) => {
           "Add engaging content sections"
         ]
       };
-      aiPromptCache.set(cacheKey, fallback, 300); // Cache fallback for 5 minutes
+      aiPromptCache.set(cacheKey, fallback, 300);
       return res.json(fallback);
     }
 
-    // Generate AI suggestions using Gemini
     const prompt = `
 Analyze this website's HTML content and traffic data to provide specific, actionable improvement suggestions.
 
@@ -931,21 +1481,18 @@ Return only the suggestions as a JSON array of strings, no additional text or fo
 
     let suggestions;
     try {
-      // Try to parse as JSON array
       suggestions = JSON.parse(text);
       if (!Array.isArray(suggestions)) {
         throw new Error('Not an array');
       }
     } catch (parseError) {
       console.error('AI response parsing error:', parseError);
-      // Fallback: split by newlines and clean up
       suggestions = text.split('\n')
         .map(line => line.trim())
         .filter(line => line.length > 10 && !line.startsWith('[') && !line.startsWith(']'))
         .slice(0, 7);
     }
 
-    // Ensure we have at least some suggestions
     if (suggestions.length === 0) {
       suggestions = [
         "Optimize images for faster loading",
@@ -957,12 +1504,9 @@ Return only the suggestions as a JSON array of strings, no additional text or fo
     }
 
     const resultData = { improvements: suggestions };
-
-    // Cache the result for 10 minutes
     aiPromptCache.set(cacheKey, resultData, 600);
 
     console.log('Generated AI improvements for:', domain, suggestions.length, 'suggestions');
-
     res.json(resultData);
 
   } catch (error) {
@@ -994,7 +1538,6 @@ app.post('/api/websites', apiLimiter, async (req, res) => {
       return res.status(400).json({ error: 'User ID is required' });
     }
 
-    // Validate domain format (basic check)
     const domainRegex = /^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/;
     if (!domainRegex.test(domain)) {
       return res.status(400).json({ error: 'Invalid domain format' });
@@ -1007,7 +1550,7 @@ app.post('/api/websites', apiLimiter, async (req, res) => {
         .select();
 
       if (error) {
-        if (error.code === '23505') { // Unique violation
+        if (error.code === '23505') {
           return res.status(409).json({ error: 'Domain already registered for this user' });
         }
         console.error('Database insert error:', error);
@@ -1022,7 +1565,6 @@ app.post('/api/websites', apiLimiter, async (req, res) => {
         created_at: data[0].created_at
       });
     } else {
-      // Fallback if no DB
       res.status(201).json({
         id: uuidv4(),
         userId: userId,
@@ -1060,7 +1602,6 @@ app.get('/api/websites/:userId', apiLimiter, async (req, res) => {
       console.log('✅ Websites fetched for user:', userId, 'count:', data.length);
       res.json(data);
     } else {
-      // Fallback if no DB
       res.json([]);
     }
   } catch (error) {
@@ -1096,18 +1637,173 @@ app.post('/api/help-requests', apiLimiter, async (req, res) => {
   }
 });
 
-// --- PAYPAL ENDPOINTS ---
+// --- DEBUG ENDPOINT ---
+app.get('/api/debug/:domain', apiLimiter, async (req, res) => {
+  const { domain } = req.params;
+  
+  try {
+    let pageViews = [];
+    let dbStatus = 'disconnected';
+    
+    if (supabase) {
+      const { data, error } = await supabase
+        .from('page_views')
+        .select('*')
+        .eq('site_id', domain)
+        .order('created_at', { ascending: false })
+        .limit(20);
 
-// Create subscription
-// Create subscription - FIXED VERSION
+      if (!error) {
+        pageViews = data || [];
+        dbStatus = 'connected';
+      } else {
+        console.error('Debug endpoint database error:', error);
+      }
+    }
 
-// Debug PayPal LIVE configuration
+    res.json({
+      domain,
+      database: dbStatus,
+      totalRecords: pageViews.length,
+      sampleRecords: pageViews.slice(0, 5),
+      allVisitors: [...new Set(pageViews.map(pv => pv.visitor_id))],
+      supabaseConfigured: !!supabase
+    });
+
+  } catch (error) {
+    console.error('Debug endpoint error:', error);
+    res.status(500).json({ 
+      error: error.message,
+      supabaseConfigured: !!supabase
+    });
+  }
+});
+
+// --- TRACKER SCRIPT ---
+app.get('/tracker.js', (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+  res.setHeader('Vary', 'Origin');
+
+  const trackerScript = `
+(function() {
+  'use strict';
+
+  const config = {
+    backendUrl: 'https://${req.get('host')}',
+    trackEngagement: true,
+    trackPageExit: true
+  };
+
+  if (window.self !== window.top) {
+    return;
+  }
+
+  const script = document.currentScript;
+  const siteId = script?.getAttribute('data-site-id');
+
+  if (!siteId) {
+    console.error('Insight AI: Missing data-site-id attribute.');
+    return;
+  }
+
+  let visitorId = localStorage.getItem('insight_ai_visitor_id');
+  if (!visitorId) {
+    visitorId = 'v2-' + Math.random().toString(36).substr(2, 9) + Date.now().toString(36);
+    try {
+      localStorage.setItem('insight_ai_visitor_id', visitorId);
+    } catch (e) {
+      sessionStorage.setItem('insight_ai_visitor_id', visitorId);
+    }
+  }
+
+  const pageData = {
+    siteId: siteId,
+    visitorId: visitorId,
+    path: window.location.pathname,
+    referrer: document.referrer,
+    screenWidth: screen.width,
+    screenHeight: screen.height,
+    language: navigator.language,
+    timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+    userAgent: navigator.userAgent,
+    timestamp: Date.now()
+  };
+
+  function sendTracking(eventType = 'pageview', customData = {}) {
+    const trackingData = { ...pageData, ...customData, eventType };
+
+    if (navigator.sendBeacon) {
+      const blob = new Blob([JSON.stringify(trackingData)], { type: 'application/json' });
+      navigator.sendBeacon(config.backendUrl + '/track', blob);
+    } else {
+      fetch(config.backendUrl + '/track', {
+        method: 'POST',
+        body: JSON.stringify(trackingData),
+        headers: { 'Content-Type': 'application/json' },
+        keepalive: true,
+        mode: 'no-cors'
+      }).catch(() => {});
+    }
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', () => sendTracking('pageview'));
+  } else {
+    setTimeout(() => sendTracking('pageview'), 100);
+  }
+
+  if (config.trackPageExit) {
+    window.addEventListener('beforeunload', function() {
+      sendTracking('pageexit', { exitTime: Date.now() });
+    });
+  }
+
+  if (config.trackEngagement) {
+    let engaged = false;
+    const engagementEvents = ['click', 'scroll', 'keydown', 'mousemove'];
+
+    engagementEvents.forEach(event => {
+      document.addEventListener(event, function() {
+        if (!engaged) {
+          engaged = true;
+          sendTracking('engagement', { engagementTime: Date.now() });
+        }
+      }, { once: true, passive: true });
+    });
+  }
+
+  window.insightAI = window.insightAI || {};
+  window.insightAI.track = function(eventName, customData = {}) {
+    sendTracking(eventName, customData);
+  };
+
+  console.log('✅ Insight AI Tracker Loaded for site:', siteId);
+})();
+  `;
+
+  res.setHeader('Content-Type', 'application/javascript');
+  res.setHeader('Cache-Control', 'public, max-age=3600');
+  res.send(trackerScript);
+});
+
+// --- HEALTH CHECK ENDPOINT ---
+app.get('/api/health', (req, res) => {
+  res.status(200).json({ 
+    status: 'OK', 
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime(),
+    tracking: 'active',
+    database: supabase ? 'connected' : 'disconnected'
+  });
+});
+
+// --- PAYPAL ENDPOINTS (KEEP EXISTING) ---
 app.get('/api/paypal/debug-live', (req, res) => {
   const hasClientId = !!process.env.PAYPAL_CLIENT_ID;
   const hasClientSecret = !!process.env.PAYPAL_CLIENT_SECRET;
   const environment = process.env.PAYPAL_ENVIRONMENT || 'not set';
   
-  // Check if credentials look like live credentials
   const clientId = process.env.PAYPAL_CLIENT_ID || '';
   const isLikelyLive = clientId.startsWith('A') && clientId.length > 50;
   
@@ -1130,8 +1826,6 @@ app.get('/api/paypal/debug-live', (req, res) => {
   });
 });
 
-
-// Create subscription - LIVE VERSION
 app.post("/api/paypal/create-subscription", apiLimiter, async (req, res) => {
   try {
     const { plan } = req.body;
@@ -1141,7 +1835,6 @@ app.post("/api/paypal/create-subscription", apiLimiter, async (req, res) => {
       return res.status(400).json({ error: 'Plan is required' });
     }
 
-    // Use your LIVE plan IDs (replace these with your actual LIVE plan IDs)
     const planIds = {
       starter: process.env.PAYPAL_PLAN_ID_STARTER || "P-24X86838G1075281RNDOTOTQ",
       pro: process.env.PAYPAL_PLAN_ID_PRO || "P-2RL41504YR730211YNDOTOTY",
@@ -1155,7 +1848,6 @@ app.post("/api/paypal/create-subscription", apiLimiter, async (req, res) => {
 
     console.log('Using LIVE plan ID:', planId);
 
-    // Get OAuth2 token - USING LIVE ENDPOINT
     const auth = Buffer.from(
       `${process.env.PAYPAL_CLIENT_ID}:${process.env.PAYPAL_CLIENT_SECRET}`
     ).toString("base64");
@@ -1181,7 +1873,6 @@ app.post("/api/paypal/create-subscription", apiLimiter, async (req, res) => {
     const { access_token } = await tokenRes.json();
     console.log('✅ Successfully obtained PayPal LIVE access token');
 
-    // Create Subscription - USING LIVE ENDPOINT
     const subRes = await fetch("https://api-m.paypal.com/v1/billing/subscriptions", {
       method: "POST",
       headers: {
@@ -1218,7 +1909,6 @@ app.post("/api/paypal/create-subscription", apiLimiter, async (req, res) => {
     const subscription = await subRes.json();
     console.log("✅ Created PayPal LIVE subscription:", subscription.id);
 
-    // Find approval URL
     const approvalLink = subscription.links.find(link => link.rel === 'approve');
     
     if (!approvalLink) {
@@ -1240,8 +1930,7 @@ app.post("/api/paypal/create-subscription", apiLimiter, async (req, res) => {
     });
   }
 });
-// Activate subscription (webhook handler)
-// Activate subscription (webhook handler) - LIVE VERSION
+
 app.post('/api/paypal/activate-subscription', apiLimiter, async (req, res) => {
   try {
     const { subscriptionId, userId } = req.body;
@@ -1250,7 +1939,6 @@ app.post('/api/paypal/activate-subscription', apiLimiter, async (req, res) => {
       return res.status(400).json({ error: 'Subscription ID and User ID are required' });
     }
 
-    // Get OAuth2 token to verify subscription - USING LIVE ENDPOINT
     const auth = Buffer.from(
       `${process.env.PAYPAL_CLIENT_ID}:${process.env.PAYPAL_CLIENT_SECRET}`
     ).toString("base64");
@@ -1272,7 +1960,6 @@ app.post('/api/paypal/activate-subscription', apiLimiter, async (req, res) => {
 
     const { access_token } = await tokenRes.json();
 
-    // Get subscription details - USING LIVE ENDPOINT
     const subRes = await fetch(`https://api-m.paypal.com/v1/billing/subscriptions/${subscriptionId}`, {
       method: "GET",
       headers: {
@@ -1296,10 +1983,8 @@ app.post('/api/paypal/activate-subscription', apiLimiter, async (req, res) => {
       });
     }
 
-    // Generate tracking code
     const trackingCode = uuidv4().replace(/-/g, '').substring(0, 16);
 
-    // Determine plan based on plan_id - USE YOUR LIVE PLAN IDs
     const planIds = {
       [process.env.PAYPAL_PLAN_ID_STARTER || "P-24X86838G1075281RNDOTOTQ"]: "starter",
       [process.env.PAYPAL_PLAN_ID_PRO || "P-2RL41504YR730211YNDOTOTY"]: "pro", 
@@ -1308,7 +1993,6 @@ app.post('/api/paypal/activate-subscription', apiLimiter, async (req, res) => {
 
     const plan = planIds[subscription.plan_id] || 'starter';
 
-    // Update user profile in Supabase
     if (supabase) {
       const { error } = await supabase
         .from('profiles')
@@ -1340,7 +2024,7 @@ app.post('/api/paypal/activate-subscription', apiLimiter, async (req, res) => {
     res.status(500).json({ error: 'Failed to activate LIVE subscription' });
   }
 });
-// Get user subscription status
+
 app.get('/api/paypal/subscription-status/:userId', apiLimiter, async (req, res) => {
   try {
     const { userId } = req.params;
@@ -1376,10 +2060,160 @@ app.get('/api/paypal/subscription-status/:userId', apiLimiter, async (req, res) 
   }
 });
 
+// --- EMAIL FALLBACK ENDPOINT ---
+// Replace your existing getEmailTransporter function with this:
+
+// Replace your existing email endpoint with this:
+app.post('/api/send-analytics-report', apiLimiter, async (req, res) => {
+  try {
+    const { to, subject, html, text } = req.body;
+
+    console.log('📧 Received email request:', { 
+      to, 
+      subject: subject?.substring(0, 50) + (subject?.length > 50 ? '...' : ''),
+      htmlLength: html?.length || 0 
+    });
+
+    // Validate required fields
+    if (!to || !subject || !html) {
+      return res.status(400).json({ 
+        error: 'Missing required fields',
+        details: {
+          to: !to ? 'missing' : 'provided',
+          subject: !subject ? 'missing' : 'provided', 
+          html: !html ? 'missing' : 'provided'
+        }
+      });
+    }
+
+    // Validate email format
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(to)) {
+      return res.status(400).json({ 
+        error: 'Invalid email address format',
+        provided: to
+      });
+    }
+
+    const transporter = getEmailTransporter();
+    if (!transporter) {
+      return res.status(500).json({ 
+        error: 'Email service not configured',
+        details: 'Please check your SMTP configuration in environment variables',
+        requiredVars: ['SMTP_HOST', 'SMTP_USER', 'SMTP_PASS', 'SMTP_FROM'],
+        currentConfig: {
+          SMTP_HOST: process.env.SMTP_HOST ? 'set' : 'missing',
+          SMTP_USER: process.env.SMTP_USER ? 'set' : 'missing',
+          SMTP_PASS: process.env.SMTP_PASS ? 'set' : 'missing',
+          SMTP_FROM: process.env.SMTP_FROM ? 'set' : 'missing'
+        }
+      });
+    }
+
+    console.log('📧 Sending email to:', to);
+
+    const mailOptions = {
+      from: process.env.SMTP_FROM || process.env.SMTP_USER,
+      to: to,
+      subject: subject,
+      html: html,
+      text: text || html.replace(/<[^>]*>/g, '').substring(0, 500), // Create text version from HTML
+      // Optional: Add reply-to
+      replyTo: process.env.SMTP_REPLY_TO || process.env.SMTP_FROM || process.env.SMTP_USER
+    };
+
+    const info = await transporter.sendMail(mailOptions);
+    console.log('✅ Email sent successfully:', {
+      messageId: info.messageId,
+      to: to,
+      subject: subject
+    });
+
+    res.json({
+      success: true,
+      messageId: info.messageId,
+      method: 'nodemailer',
+      message: 'Analytics report sent successfully'
+    });
+
+  } catch (error) {
+    console.error('❌ Email sending failed:', error);
+    
+    let errorMessage = 'Failed to send email';
+    let errorDetails = error.message;
+    
+    // Provide more specific error messages for common issues
+    if (error.code === 'EAUTH') {
+      errorMessage = 'Email authentication failed';
+      errorDetails = 'Please check your SMTP username and password (app password for Gmail)';
+    } else if (error.code === 'ECONNECTION') {
+      errorMessage = 'Cannot connect to email server';
+      errorDetails = 'Please check your SMTP host and port configuration';
+    } else if (error.code === 'ENOTFOUND') {
+      errorMessage = 'Email server not found';
+      errorDetails = 'Please check your SMTP host address';
+    }
+
+    res.status(500).json({
+      error: errorMessage,
+      details: errorDetails,
+      code: error.code
+    });
+  }
+});
+// Add to your backend (index.js)
+app.get('/api/debug-recent-visitors/:domain', apiLimiter, async (req, res) => {
+  const { domain } = req.params;
+  const { limit = 50 } = req.query;
+  const userId = req.headers['x-user-id'] || req.query.userId;
+
+  console.log('🔍 Debug recent visitors request:', { domain, limit, userId });
+
+  if (!supabase) {
+    return res.json({ error: 'Database not configured', data: [] });
+  }
+
+  try {
+    const { data, error } = await supabase
+      .from('page_views')
+      .select('*')
+      .eq('site_id', domain)
+      .order('created_at', { ascending: false })
+      .limit(parseInt(limit));
+
+    if (error) {
+      console.error('Database error:', error);
+      return res.json({ error: error.message, data: [] });
+    }
+
+    console.log('✅ Found visitors:', data?.length || 0);
+    res.json({
+      success: true,
+      count: data?.length || 0,
+      data: data || [],
+      sample: data?.[0] || null
+    });
+
+  } catch (error) {
+    console.error('Debug endpoint error:', error);
+    res.status(500).json({ error: error.message, data: [] });
+  }
+});
+
 // --- ERROR HANDLING ---
 app.use((error, req, res, next) => {
-  console.error('Unhandled error:', error);
-  res.status(500).json({ error: 'Internal server error' });
+  console.error('Error:', {
+    message: error.message,
+    stack: error.stack,
+    url: req.url,
+    method: req.method,
+    timestamp: new Date().toISOString()
+  });
+  
+  res.status(500).json({ 
+    error: 'Internal server error',
+    referenceId: generateErrorId()
+  });
 });
 
 // --- 404 HANDLER ---
@@ -1392,16 +2226,17 @@ app.use((req, res) => {
 });
 
 // --- START SERVER ---
-app.listen(port, () => {
+server.listen(port, () => {
   console.log(`🚀 Backend server running on http://localhost:${port}`);
+  console.log(`🔌 Socket.IO server running`);
   console.log(`📊 Health check: http://localhost:${port}/api/health`);
   console.log(`📈 Stats endpoint: http://localhost:${port}/api/stats/:domain`);
+  console.log(`📊 Chart data: http://localhost:${port}/api/chart-data/:domain`);
+  console.log(`👥 Recent visitors: http://localhost:${port}/api/recent-visitors/:domain`);
   console.log(`🤖 AI endpoints: http://localhost:${port}/api/suggestions`);
   console.log(`🔧 Improvements endpoint: http://localhost:${port}/api/improvements`);
   console.log(`📝 Tracker script: http://localhost:${port}/tracker.js`);
   console.log(`🎯 Tracking endpoint: http://localhost:${port}/track`);
   console.log(`🐛 Debug endpoint: http://localhost:${port}/api/debug/:domain`);
   console.log(`💳 PayPal create subscription: http://localhost:${port}/api/paypal/create-subscription`);
-  console.log(`✅ PayPal activate subscription: http://localhost:${port}/api/paypal/activate-subscription`);
-  console.log(`📋 PayPal subscription status: http://localhost:${port}/api/paypal/subscription-status/:userId`);
 });
