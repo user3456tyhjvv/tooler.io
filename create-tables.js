@@ -65,6 +65,95 @@ async function createTables() {
       console.log('✅ websites table created or already exists');
     }
 
+    // Create users table for admin user management
+    const { error: usersError } = await supabase.rpc('exec_sql', {
+      sql: `
+        CREATE TABLE IF NOT EXISTS users (
+          id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+          email TEXT UNIQUE NOT NULL,
+          full_name TEXT,
+          role TEXT DEFAULT 'user',
+          trial_start_date TIMESTAMPTZ DEFAULT NOW(),
+          trial_end_date TIMESTAMPTZ,
+          is_active BOOLEAN DEFAULT true,
+          created_at TIMESTAMPTZ DEFAULT NOW(),
+          updated_at TIMESTAMPTZ DEFAULT NOW()
+        );
+      `
+    });
+
+    if (usersError) {
+      console.error('Error creating users table:', usersError);
+    } else {
+      console.log('✅ users table created or already exists');
+    }
+
+    // Create messages table for chat functionality
+    const { error: messagesError } = await supabase.rpc('exec_sql', {
+      sql: `
+        CREATE TABLE IF NOT EXISTS messages (
+          id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+          sender_id UUID REFERENCES users(id),
+          recipient_id UUID REFERENCES users(id),
+          content TEXT NOT NULL,
+          message_type TEXT DEFAULT 'text',
+          is_read BOOLEAN DEFAULT false,
+          created_at TIMESTAMPTZ DEFAULT NOW()
+        );
+      `
+    });
+
+    if (messagesError) {
+      console.error('Error creating messages table:', messagesError);
+    } else {
+      console.log('✅ messages table created or already exists');
+    }
+
+    // Create notifications table for admin notifications
+    const { error: notificationsError } = await supabase.rpc('exec_sql', {
+      sql: `
+        CREATE TABLE IF NOT EXISTS notifications (
+          id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+          user_id UUID REFERENCES users(id),
+          title TEXT NOT NULL,
+          message TEXT NOT NULL,
+          type TEXT DEFAULT 'info',
+          is_read BOOLEAN DEFAULT false,
+          sent_by UUID REFERENCES users(id),
+          created_at TIMESTAMPTZ DEFAULT NOW()
+        );
+      `
+    });
+
+    if (notificationsError) {
+      console.error('Error creating notifications table:', notificationsError);
+    } else {
+      console.log('✅ notifications table created or already exists');
+    }
+
+    // Create user_trials table for trial management
+    const { error: trialsError } = await supabase.rpc('exec_sql', {
+      sql: `
+        CREATE TABLE IF NOT EXISTS user_trials (
+          id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+          user_id UUID REFERENCES users(id),
+          start_date TIMESTAMPTZ DEFAULT NOW(),
+          end_date TIMESTAMPTZ NOT NULL,
+          status TEXT DEFAULT 'active',
+          notified_3_days BOOLEAN DEFAULT false,
+          notified_1_day BOOLEAN DEFAULT false,
+          notified_expired BOOLEAN DEFAULT false,
+          created_at TIMESTAMPTZ DEFAULT NOW()
+        );
+      `
+    });
+
+    if (trialsError) {
+      console.error('Error creating user_trials table:', trialsError);
+    } else {
+      console.log('✅ user_trials table created or already exists');
+    }
+
     // Create indexes
     const { error: indexError1 } = await supabase.rpc('exec_sql', {
       sql: 'CREATE INDEX IF NOT EXISTS idx_page_views_site_id ON page_views(site_id);'

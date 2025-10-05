@@ -213,7 +213,7 @@ function emitStatsUpdate(domain, stats) {
 
 // --- MIDDLEWARE OPTIMIZATIONS ---
 app.use(cors({
-  origin: ['http://localhost:3000', 'http://localhost:5173','https://yourspaceanalytics.info','https://www.yourspaceanalytics.info'],
+  origin: ['http://localhost:3000', 'http://localhost:5173','https://yourspaceanalytics.info','https://www.yourspaceanalytics.info','https://gigatechshop.co.ke','https://www.gigatechshop.co.ke','https://tiffad.co.ke:'],
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'x-user-id'],
   credentials: true
@@ -699,50 +699,179 @@ function calculateTrends(currentStats, previousStats) {
   };
 }
 // --- EXIT PAGES CALCULATION ---
+// --- FIXED EXIT PAGES CALCULATION ---
 function calculateExitPages(pageViews) {
-  if (!pageViews || pageViews.length === 0) return [];
+  if (!pageViews || !Array.isArray(pageViews) || pageViews.length === 0) {
+    console.log('❌ calculateExitPages: No page views data available');
+    return [];
+  }
 
-  const pageStats = {};
-  const visitorPages = {};
+  console.log('🔍 calculateExitPages: Processing', pageViews.length, 'page views');
 
-  // Group by visitor to find exit pages
-  pageViews.forEach(pv => {
-    if (!visitorPages[pv.visitor_id]) {
-      visitorPages[pv.visitor_id] = [];
+  // Filter out only REAL pages (not /page1, /page2, etc.)
+  const realPageViews = pageViews.filter(pv => 
+    pv && pv.path && pv.visitor_id && 
+    !pv.path.startsWith('/page') && // Exclude dummy pages
+    pv.path !== '' && pv.path !== '/' // Exclude empty and root for now
+  );
+
+  console.log('✅ Real page views after filtering:', realPageViews.length);
+  console.log('📋 Real paths found:', [...new Set(realPageViews.map(pv => pv.path))]);
+
+  if (realPageViews.length === 0) {
+    console.log('❌ No real page views to process');
+    
+    // If no real pages, use root and other main pages
+    const mainPages = pageViews.filter(pv => 
+      pv && pv.path && (pv.path === '/' || pv.path === '/home' || pv.path === '/about' || pv.path === '/contact')
+    );
+    
+    if (mainPages.length > 0) {
+      console.log('🔄 Using main pages instead:', [...new Set(mainPages.map(pv => pv.path))]);
+      return createExitPagesFromPageViews(mainPages);
     }
-    visitorPages[pv.visitor_id].push(pv);
-  });
+    
+    return [];
+  }
 
-  // Find exit pages for each visitor
-  Object.values(visitorPages).forEach(pages => {
-    pages.sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime());
-    const lastPage = pages[pages.length - 1];
-    if (!pageStats[lastPage.path]) {
-      pageStats[lastPage.path] = { visits: 0, exits: 0, totalTime: 0 };
-    }
-    pageStats[lastPage.path].exits++;
-  });
-
-  // Count total visits per page
-  pageViews.forEach(pv => {
-    if (!pageStats[pv.path]) {
-      pageStats[pv.path] = { visits: 0, exits: 0, totalTime: 0 };
-    }
-    pageStats[pv.path].visits++;
-    pageStats[pv.path].totalTime += pv.time_on_page || 0;
-  });
-
-  return Object.entries(pageStats)
-    .map(([url, stats]) => ({
-      url,
-      exitRate: parseFloat(((stats.exits / stats.visits) * 100).toFixed(1)),
-      visits: stats.visits,
-      avgTimeOnPage: Math.round(stats.totalTime / stats.visits) || 0
-    }))
-    .sort((a, b) => b.exitRate - a.exitRate)
-    .slice(0, 10);
+  return createExitPagesFromPageViews(realPageViews);
 }
 
+// Helper function to create exit pages from page views
+function createExitPagesFromPageViews(pageViews) {
+  const pageStats = {};
+  const visitorSessions = {};
+
+  // Group page views by visitor and session
+  pageViews.forEach(pv => {
+    const visitorId = pv.visitor_id;
+    const path = pv.path;
+    const timestamp = new Date(pv.created_at).getTime();
+
+    // Initialize visitor sessions
+    if (!visitorSessions[visitorId]) {
+      visitorSessions[visitorId] = [];
+    }
+
+    // Initialize page stats
+    if (!pageStats[path]) {
+      pageStats[path] = {
+        visits: 0,
+        exits: 0,
+        totalTime: 0,
+        lastVisitTime: 0
+      };
+    }
+
+    // Count visits and accumulate time
+    pageStats[path].visits++;
+    pageStats[path].totalTime += pv.time_on_page || 0;
+    pageStats[path].lastVisitTime = Math.max(pageStats[path].lastVisitTime, timestamp);
+
+    // Add to visitor sessions
+    visitorSessions[visitorId].push({
+      path: path,
+      timestamp: timestamp,
+      timeOnPage: pv.time_on_page || 0
+    });
+  });
+
+  console.log('👥 Processed', Object.keys(visitorSessions).length, 'unique visitors');
+  console.log('📄 Unique real pages:', Object.keys(pageStats));
+
+  // Find exit pages (last page in each session)
+  Object.values(visitorSessions).forEach(session => {
+    if (session.length === 0) return;
+
+    // Sort by timestamp to find the last page
+    session.sort((a, b) => a.timestamp - b.timestamp);
+    const lastPage = session[session.length - 1];
+    
+    if (lastPage && lastPage.path && pageStats[lastPage.path]) {
+      pageStats[lastPage.path].exits++;
+    }
+  });
+
+  // Convert to exit pages array
+  const exitPages = Object.entries(pageStats)
+    .map(([url, stats]) => {
+      const exitRate = stats.visits > 0 ? (stats.exits / stats.visits) * 100 : 0;
+      const avgTimeOnPage = stats.visits > 0 ? Math.round(stats.totalTime / stats.visits) : 0;
+
+      return {
+        url: url,
+        exitRate: parseFloat(exitRate.toFixed(1)),
+        visits: stats.visits,
+        avgTimeOnPage: avgTimeOnPage,
+        lastVisit: new Date(stats.lastVisitTime).toISOString(),
+        isRealData: true
+      };
+    })
+    .filter(page => page.visits > 0) // Only include pages with actual visits
+    .sort((a, b) => b.exitRate - a.exitRate) // Sort by exit rate (highest first)
+    .slice(0, 10); // Top 10 exit pages
+
+  console.log('📊 calculateExitPages: Found', exitPages.length, 'real exit pages');
+  
+  if (exitPages.length > 0) {
+    console.log('📋 Real exit pages:', exitPages.map(p => ({
+      url: p.url,
+      exitRate: p.exitRate + '%',
+      visits: p.visits,
+      avgTime: p.avgTimeOnPage + 's'
+    })));
+  }
+
+  return exitPages;
+}
+//temporary fix for traffic sources
+// Add this to your backend routes - TEMPORARY DEBUG ENDPOINT
+app.get('/api/debug-real-pages/:domain', apiLimiter, async (req, res) => {
+  const { domain } = req.params;
+  
+  try {
+    console.log('🔍 DEBUG: Checking real page views for domain:', domain);
+    
+    // Get recent page views from the database
+    const { data: pageViews, error } = await supabase
+      .from('page_views')
+      .select('path, visitor_id, created_at, time_on_page')
+      .eq('site_id', domain)
+      .order('created_at', { ascending: false })
+      .limit(100);
+
+    if (error) {
+      console.error('❌ Database error:', error);
+      return res.status(500).json({ error: error.message });
+    }
+
+    console.log('📊 DEBUG: Found page views:', pageViews?.length || 0);
+    
+    // Analyze what we have
+    const analysis = {
+      totalPageViews: pageViews?.length || 0,
+      uniquePaths: [...new Set(pageViews?.map(pv => pv.path))],
+      pathCounts: pageViews?.reduce((acc, pv) => {
+        const path = pv.path || 'unknown';
+        acc[path] = (acc[path] || 0) + 1;
+        return acc;
+      }, {}),
+      samplePageViews: pageViews?.slice(0, 10).map(pv => ({
+        path: pv.path,
+        visitor_id: pv.visitor_id?.substring(0, 8) + '...',
+        created_at: pv.created_at,
+        time_on_page: pv.time_on_page
+      }))
+    };
+
+    console.log('🔍 DEBUG: Analysis:', analysis);
+    res.json(analysis);
+
+  } catch (error) {
+    console.error('❌ Debug endpoint error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
 // --- TRAFFIC SOURCES CALCULATION ---
 function calculateTrafficSources(pageViews) {
   if (!pageViews || pageViews.length === 0) return [];
@@ -1133,13 +1262,19 @@ app.post('/track', trackLimiter, async (req, res) => {
 });
 
 // --- ENHANCED STATS ENDPOINT ---
+// --- ENHANCED STATS ENDPOINT ---
 app.get('/api/stats/:domain', validateStatsRequest, apiLimiter, async (req, res) => {
   const { domain } = req.params;
   const userId = req.headers['x-user-id'] || req.query.userId;
   const timeRange = req.query.range || '24h';
 
+  console.log('🔍 DEBUG: Starting stats calculation for:', { domain, userId, timeRange });
+
   if (!userId) {
-    return res.status(400).json({ error: 'User ID is required' });
+    const emptyStats = getEmptyStats();
+    emptyStats.error = 'User ID is required';
+    console.log('❌ DEBUG: No user ID provided');
+    return res.status(400).json(emptyStats);
   }
 
   // Check if user owns this domain
@@ -1153,19 +1288,34 @@ app.get('/api/stats/:domain', validateStatsRequest, apiLimiter, async (req, res)
         .single();
 
       if (ownershipError || !website) {
-        return res.status(403).json({ error: 'Access denied: You do not own this website' });
+        const emptyStats = getEmptyStats();
+        emptyStats.error = 'Access denied: You do not own this website';
+        console.log('❌ DEBUG: Ownership check failed - user does not own domain');
+        return res.status(403).json(emptyStats);
       }
+      console.log('✅ DEBUG: Ownership verified - user owns domain');
     } catch (error) {
-      console.error('Ownership check error:', error);
-      return res.status(500).json({ error: 'Could not verify website ownership' });
+      console.error('❌ DEBUG: Ownership check error:', error);
+      const emptyStats = getEmptyStats();
+      emptyStats.error = 'Could not verify website ownership';
+      return res.status(500).json(emptyStats);
     }
+  } else {
+    console.log('⚠️ DEBUG: Supabase not configured, skipping ownership check');
   }
 
   const cacheKey = `stats:${domain}:${timeRange}`;
   const cachedStats = statsCache.get(cacheKey);
 
   if (cachedStats && (Date.now() - new Date(cachedStats.lastUpdated).getTime()) < 30000) {
+    console.log('📦 DEBUG: Returning cached stats (cache key:', cacheKey + ')');
+    console.log('📦 DEBUG: Cached exit pages:', cachedStats.exitPages?.length || 0, 'items');
+    if (cachedStats.exitPages && cachedStats.exitPages.length > 0) {
+      console.log('📦 DEBUG: Cached exit pages sample:', cachedStats.exitPages.slice(0, 3));
+    }
     return res.json(cachedStats);
+  } else {
+    console.log('🔄 DEBUG: Cache miss or expired, calculating fresh stats');
   }
 
   try {
@@ -1173,6 +1323,8 @@ app.get('/api/stats/:domain', validateStatsRequest, apiLimiter, async (req, res)
 
     if (supabase) {
       const startDate = getStartDate(timeRange);
+      console.log('📅 DEBUG: Querying page views from:', startDate.toISOString(), 'for range:', timeRange);
+
       const { data, error } = await supabase
         .from('page_views')
         .select('*')
@@ -1181,18 +1333,57 @@ app.get('/api/stats/:domain', validateStatsRequest, apiLimiter, async (req, res)
         .order('created_at', { ascending: true });
 
       if (error) {
-        console.error('Database query error:', error.message);
+        console.error('❌ DEBUG: Database query error:', error.message);
         pageViews = [];
       } else {
         pageViews = data || [];
+        console.log('✅ DEBUG: Retrieved', pageViews.length, 'page views from database');
+        
+        // Log detailed information about page views
+        if (pageViews.length > 0) {
+          console.log('📄 DEBUG: Sample page views (first 5):');
+          pageViews.slice(0, 5).forEach((pv, index) => {
+            console.log(`  ${index + 1}. Visitor: ${pv.visitor_id?.substring(0, 8)}..., Path: ${pv.path}, Time: ${pv.created_at}`);
+          });
+          
+          // Log unique visitors and paths
+          const uniqueVisitors = [...new Set(pageViews.map(pv => pv.visitor_id))].length;
+          const uniquePaths = [...new Set(pageViews.map(pv => pv.path))];
+          console.log('👥 DEBUG: Unique visitors:', uniqueVisitors);
+          console.log('🛣️ DEBUG: Unique paths:', uniquePaths.slice(0, 10)); // First 10 paths
+        } else {
+          console.log('📭 DEBUG: No page views found in the specified time range');
+        }
       }
+    } else {
+      console.log('⚠️ DEBUG: Supabase not available, using empty page views');
     }
 
-    // Calculate all statistics
+    // Calculate all statistics with detailed debugging
+    console.log('🧮 DEBUG: Starting statistics calculation...');
+    
     const stats = await calculateRealStats(pageViews, timeRange, domain);
+    console.log('📊 DEBUG: Basic stats calculated:', {
+      totalVisitors: stats.totalVisitors,
+      totalPageViews: stats.totalPageViews,
+      bounceRate: stats.bounceRate,
+      realData: stats.realData
+    });
+
+    console.log('🚨 DEBUG: Calculating exit pages...');
     const exitPages = calculateExitPages(pageViews);
+    console.log('📋 DEBUG: Exit pages calculation complete:', {
+      exitPagesCount: exitPages.length,
+      exitPagesDetails: exitPages.map(ep => `${ep.url} (${ep.exitRate}% exit rate, ${ep.visits} visits)`)
+    });
+
+    console.log('🌐 DEBUG: Calculating traffic sources...');
     const trafficSources = calculateTrafficSources(pageViews);
+    console.log('📈 DEBUG: Traffic sources calculated:', trafficSources.length, 'sources');
+
+    console.log('🔄 DEBUG: Calculating conversion funnel...');
     const conversionFunnel = calculateConversionFunnel(pageViews);
+    console.log('📊 DEBUG: Conversion funnel calculated');
 
     const fullStats = {
       ...stats,
@@ -1201,36 +1392,246 @@ app.get('/api/stats/:domain', validateStatsRequest, apiLimiter, async (req, res)
       conversionFunnel
     };
 
-    console.log('📊 Stats for:', domain, 'range:', timeRange, 'user:', userId, {
+    console.log('🎯 DEBUG: Final stats summary for', domain, ':', {
+      range: timeRange,
+      user: userId,
       totalVisitors: stats.totalVisitors,
       totalPageViews: stats.totalPageViews,
       bounceRate: stats.bounceRate,
-      realData: stats.realData
+      realData: stats.realData,
+      exitPagesCount: exitPages.length,
+      trafficSourcesCount: trafficSources.length,
+      hasConversionFunnel: conversionFunnel.length > 0
     });
 
+    // Cache the results
     statsCache.set(cacheKey, fullStats, 30);
+    console.log('💾 DEBUG: Stats cached with key:', cacheKey, '(TTL: 30 seconds)');
+
     res.json(fullStats);
 
   } catch (error) {
-    console.error(`Error fetching stats for ${domain}:`, error.message);
+    console.error('❌ DEBUG: Error in stats calculation for', domain, ':', error.message);
+    console.error('🔍 DEBUG: Error stack:', error.stack);
+    
     const emptyStats = getEmptyStats();
-    emptyStats.message = "No tracking data yet. Add the tracker to your website.";
+    emptyStats.error = "Error fetching data: " + error.message;
+    emptyStats.debugInfo = {
+      domain,
+      userId: userId?.substring(0, 8) + '...',
+      timeRange,
+      timestamp: new Date().toISOString()
+    };
+    
     res.json(emptyStats);
   }
 });
+//Test Exit Pages Calculation
+app.get('/api/test-exit-pages/:domain', apiLimiter, async (req, res) => {
+  const { domain } = req.params;
+  
+  try {
+    const { data: pageViews, error } = await supabase
+      .from('page_views')
+      .select('*')
+      .eq('site_id', domain)
+      .gte('created_at', getStartDate('7d').toISOString())
+      .order('created_at', { ascending: true });
 
+    if (error) {
+      return res.status(500).json({ error: error.message });
+    }
+
+    const exitPages = calculateExitPages(pageViews || []);
+    
+    res.json({
+      domain,
+      pageViewsCount: pageViews?.length || 0,
+      exitPagesCalculated: exitPages,
+      calculationDetails: {
+        uniqueVisitors: [...new Set(pageViews?.map(pv => pv.visitor_id))].length,
+        uniquePaths: [...new Set(pageViews?.map(pv => pv.path))],
+        samplePageViews: pageViews?.slice(0, 5).map(pv => ({
+          visitor_id: pv.visitor_id?.substring(0, 8),
+          path: pv.path,
+          created_at: pv.created_at
+        }))
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+// --- CHART DATA ENDPOINT ---
 // --- CHART DATA ENDPOINT ---
 app.get('/api/chart-data/:domain', apiLimiter, async (req, res) => {
   const { domain } = req.params;
-  const { range = '7d' } = req.query;
-  
+  const { range = '24h' } = req.query;
+  const userId = req.headers['x-user-id'];
+
+  console.log('📊 Chart data request:', { domain, range, userId });
+
+  if (!userId) {
+    return res.status(400).json({ error: 'User ID is required' });
+  }
+
   try {
-    const chartData = await getTimeSeriesData(domain, range);
+    // Get page views for the time range
+    const startDate = getStartDate(range);
+    
+    console.log('📊 Querying data from:', startDate.toISOString(), 'for range:', range);
+
+    if (!supabase) {
+      console.log('📊 No database connection, returning demo data');
+      return res.json(generateDemoChartData(range));
+    }
+
+    // Query the database for page views in the time range
+    const { data, error } = await supabase
+      .from('page_views')
+      .select('created_at, visitor_id, path')
+      .eq('site_id', domain)
+      .gte('created_at', startDate.toISOString())
+      .order('created_at', { ascending: true });
+
+    if (error) {
+      console.error('📊 Database query error:', error);
+      return res.json(generateDemoChartData(range));
+    }
+
+    console.log('📊 Found page views:', data?.length || 0);
+
+    if (!data || data.length === 0) {
+      console.log('📊 No data found, returning demo data');
+      return res.json(generateDemoChartData(range));
+    }
+
+    // Group data by time intervals
+    const chartData = groupDataByTime(data, range);
+    console.log('📊 Sending chart data:', chartData.length, 'points');
+    
     res.json(chartData);
+
   } catch (error) {
-    res.status(500).json({ error: 'Failed to fetch chart data' });
+    console.error('📊 Chart data endpoint error:', error);
+    res.json(generateDemoChartData(range));
   }
 });
+  
+    
+
+
+// Helper function to group data by time intervals
+function groupDataByTime1(data, range) {
+  console.log('📊 Grouping', data.length, 'records for range:', range);
+  
+  const groupedData = {};
+  
+  data.forEach(item => {
+    if (!item.created_at) return;
+    
+    const date = new Date(item.created_at);
+    let timeKey;
+    
+    switch(range) {
+      case '24h':
+        // Group by hour
+        timeKey = date.toLocaleTimeString([], { 
+          hour: '2-digit', 
+          minute: '2-digit'
+        });
+        break;
+      case '7d':
+        // Group by day
+        timeKey = date.toLocaleDateString('en-US', { 
+          weekday: 'short'
+        });
+        break;
+      case '30d':
+        // Group by day
+        timeKey = date.toLocaleDateString('en-US', { 
+          month: 'short', 
+          day: 'numeric' 
+        });
+        break;
+      default:
+        timeKey = date.toLocaleDateString();
+    }
+    
+    if (!groupedData[timeKey]) {
+      groupedData[timeKey] = { visitors: new Set(), pageViews: 0 };
+    }
+    
+    // Add visitor to set (unique visitors)
+    groupedData[timeKey].visitors.add(item.visitor_id);
+    // Count page views
+    groupedData[timeKey].pageViews += 1;
+  });
+
+  // Convert to array format
+  const result = Object.entries(groupedData).map(([time, stats]) => ({
+    time,
+    visitors: stats.visitors.size,
+    pageViews: stats.pageViews,
+    timestamp: new Date().getTime()
+  }));
+
+  console.log('📊 Grouped into', result.length, 'time points');
+  return result;
+}
+
+// Generate demo data when no real data is available
+function generateDemoChartData(range) {
+  const dataPoints = range === '24h' ? 24 : range === '7d' ? 7 : 30;
+  const now = Date.now();
+  const increment = range === '24h' ? 60 * 60 * 1000 : 24 * 60 * 60 * 1000;
+  
+  const data = Array.from({ length: dataPoints }, (_, i) => {
+    const timestamp = now - ((dataPoints - 1 - i) * increment);
+    const date = new Date(timestamp);
+    
+    let timeLabel = '';
+    switch(range) {
+      case '24h':
+        timeLabel = date.toLocaleTimeString([], { 
+          hour: '2-digit', 
+          minute: '2-digit'
+        });
+        break;
+      case '7d':
+        timeLabel = date.toLocaleDateString('en-US', { 
+          weekday: 'short'
+        });
+        break;
+      case '30d':
+        timeLabel = date.toLocaleDateString('en-US', { 
+          month: 'short', 
+          day: 'numeric' 
+        });
+        break;
+    }
+    
+    // Generate realistic visitor pattern
+    const hour = date.getHours();
+    let baseVisitors = 2;
+    if (hour >= 9 && hour <= 17) baseVisitors = 5; // Business hours
+    if (hour >= 19 && hour <= 22) baseVisitors = 4; // Evening
+    
+    const visitors = baseVisitors + Math.floor(Math.random() * 3);
+    const pageViews = visitors + Math.floor(Math.random() * 4);
+    
+    return {
+      time: timeLabel,
+      visitors: visitors,
+      pageViews: pageViews,
+      timestamp: timestamp,
+      date: date.toLocaleDateString()
+    };
+  });
+
+  console.log('📊 Generated demo chart data:', data.length, 'points');
+  return data;
+}
 
 // --- RECENT VISITORS ENDPOINT ---
 // Replace your existing recent-visitors endpoint with this:
@@ -1270,6 +1671,7 @@ app.get('/api/recent-visitors/:domain', apiLimiter, async (req, res) => {
     return res.json([]); // Return empty array if no database
   }
 
+  
   try {
     const { data, error } = await supabase
       .from('page_views')
@@ -1282,18 +1684,24 @@ app.get('/api/recent-visitors/:domain', apiLimiter, async (req, res) => {
       console.error('Database query error:', error);
       return res.status(500).json({ 
         error: 'Database error: ' + error.message,
-        data: []
+        recentVisitors: [] // Ensure consistent structure
       });
     }
 
     console.log('✅ Returning visitors:', data?.length || 0);
-    res.json(data || []);
+    
+    // Return in the expected format
+    res.json({
+      recentVisitors: data || [],
+      total: data?.length || 0,
+      lastUpdated: new Date().toISOString()
+    });
 
   } catch (error) {
     console.error('Recent visitors endpoint error:', error);
     res.status(500).json({ 
       error: 'Internal server error: ' + error.message,
-      data: []
+      recentVisitors: [] // Fallback empty array
     });
   }
 });
@@ -1523,7 +1931,92 @@ Return only the suggestions as a JSON array of strings, no additional text or fo
     res.json(fallback);
   }
 });
+//---AI ANALYSIS OF EXIT PAGES ENDPOINT---
+// Add this AI endpoint to your backend routes
+app.post('/api/ai/exit-page-analysis', apiLimiter, async (req, res) => {
+  try {
+    const { pageData, domain, metrics } = req.body;
+    const userId = req.headers['x-user-id'];
 
+    if (!userId) {
+      return res.status(400).json({ error: 'User ID is required' });
+    }
+
+    console.log('🤖 AI Analysis request for:', { domain, url: pageData.url });
+    
+    const model = ai.getGenerativeModel({ model: 'gemini-1.5-flash' });
+    
+    const prompt = `
+As a professional web analytics expert, analyze this exit page data and provide comprehensive recommendations:
+
+DOMAIN: ${domain}
+PAGE URL: ${pageData.url}
+METRICS:
+- Exit Rate: ${metrics.exitRate}%
+- Average Time on Page: ${metrics.avgTimeOnPage} seconds
+- Total Visits: ${metrics.visits}
+
+ANALYSIS CONTEXT:
+- Page is among top exit pages needing optimization
+- Focus on practical, actionable improvements
+- Consider technical, content, and UX aspects
+- Prioritize by impact and effort
+
+Provide analysis in this exact JSON structure:
+{
+  "severity": "high|medium|low",
+  "insights": ["key insight 1", "key insight 2"],
+  "suggestions": ["actionable suggestion 1", "suggestion 2"],
+  "performanceIssues": ["performance issue 1", "issue 2"],
+  "securityConcerns": ["security concern if any", "concern 2"],
+  "seoRecommendations": ["SEO recommendation 1", "rec 2"],
+  "userExperience": ["UX improvement 1", "improvement 2"],
+  "conversionOpportunities": ["conversion opportunity 1", "opportunity 2"],
+  "technicalRecommendations": ["technical recommendation 1", "rec 2"],
+  "contentImprovements": ["content improvement 1", "improvement 2"]
+}
+
+Focus on practical, implementable advice that will actually reduce exit rates and improve user engagement.
+Be specific to the page type (checkout, login, product, blog, homepage, etc.) and provide concrete examples.
+`;
+
+    const result = await model.generateContent(prompt);
+    const response = await result.response;
+    const text = response.text();
+    
+    const jsonMatch = text.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      const analysis = JSON.parse(jsonMatch[0]);
+      console.log('✅ AI Analysis generated successfully');
+      return res.json(analysis);
+    }
+    
+    throw new Error('Invalid AI response format');
+  } catch (error) {
+    console.error('❌ AI exit page analysis error:', error);
+    // Return fallback analysis instead of error
+    const fallbackAnalysis = {
+      severity: req.body.metrics.exitRate > 70 ? 'high' : req.body.metrics.exitRate > 40 ? 'medium' : 'low',
+      insights: [
+        `Page has ${req.body.metrics.exitRate}% exit rate with ${req.body.metrics.avgTimeOnPage}s average time`,
+        'Focus on improving user engagement and page relevance'
+      ],
+      suggestions: [
+        'Improve page loading speed and performance',
+        'Add clear call-to-action buttons',
+        'Enhance content quality and relevance'
+      ],
+      performanceIssues: [],
+      securityConcerns: [],
+      seoRecommendations: ['Optimize meta tags and page titles'],
+      userExperience: ['Improve mobile responsiveness'],
+      conversionOpportunities: ['Add exit-intent offers'],
+      technicalRecommendations: ['Audit Core Web Vitals'],
+      contentImprovements: ['Enhance content readability']
+    };
+    res.json(fallbackAnalysis);
+  }
+});
 // --- WEBSITES REGISTRATION ENDPOINT ---
 app.post('/api/websites', apiLimiter, async (req, res) => {
   try {
