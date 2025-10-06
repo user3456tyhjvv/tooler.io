@@ -299,7 +299,7 @@ app.options('/track', cors());
 app.options('/api/stats/:domain', cors());
 app.options('/tracker.js', cors());
 
-app.use(express.json({ limit: '10kb' }));
+app.use(express.json({ limit: '10mb' }));
 
 // Rate limiting
 const trackLimiter = rateLimit({
