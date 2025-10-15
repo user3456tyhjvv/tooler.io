@@ -12,7 +12,7 @@
   "license": "ISC",
   "description": "",
   "dependencies": {
-    "@google/genai": "^1.21.0",
+    "@google/generative-ai": "^0.21.0",
     "@paypal/checkout-server-sdk": "^1.0.3",
     "@paypal/paypal-server-sdk": "^1.1.0",
     "@paypal/react-paypal-js": "^8.9.1",

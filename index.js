@@ -2,7 +2,7 @@ import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import path from 'path';
-import { GoogleGenAI } from '@google/genai';
+import { GoogleGenerativeAI } from '@google/generative-ai';
 import { createClient } from '@supabase/supabase-js';
 import compression from 'compression';
 import rateLimit from 'express-rate-limit';
@@ -31,7 +31,7 @@ import NodeCache from 'node-cache';
 const statsCache = new NodeCache({ stdTTL: 300 });
 
 // --- INITIALIZATION ---
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+const ai = new GoogleGenerativeAI({ apiKey: process.env.GEMINI_API_KEY });
 
 // Supabase client with better error handling
 let supabase;
@@ -212,12 +212,6 @@ function emitStatsUpdate(domain, stats) {
 }
 
 // --- MIDDLEWARE OPTIMIZATIONS ---
-app.use(cors({
-  origin: ['http://localhost:3000', 'http://localhost:5173','https://yourspaceanalytics.info','https://www.yourspaceanalytics.info','https://gigatechshop.co.ke','https://www.gigatechshop.co.ke','https://tiffad.co.ke:'],
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'x-user-id'],
-  credentials: true
-}));
 app.use(helmet({
   contentSecurityPolicy: false,
   crossOriginEmbedderPolicy: false
@@ -1475,15 +1469,38 @@ app.get('/api/chart-data/:domain', apiLimiter, async (req, res) => {
     return res.status(400).json({ error: 'User ID is required' });
   }
 
+  // Check if user owns this domain
+  if (supabase) {
+    try {
+      const { data: website, error: ownershipError } = await supabase
+        .from('websites')
+        .select('id')
+        .eq('userId', userId)
+        .eq('domain', domain)
+        .single();
+
+      if (ownershipError || !website) {
+        console.log('❌ Chart data: Ownership check failed - user does not own domain');
+        // Return empty chart data instead of demo data
+        return res.json([]);
+      }
+      console.log('✅ Chart data: Ownership verified - user owns domain');
+    } catch (error) {
+      console.error('❌ Chart data: Ownership check error:', error);
+      // Return empty chart data instead of demo data
+      return res.json([]);
+    }
+  }
+
   try {
     // Get page views for the time range
     const startDate = getStartDate(range);
-    
+
     console.log('📊 Querying data from:', startDate.toISOString(), 'for range:', range);
 
     if (!supabase) {
-      console.log('📊 No database connection, returning demo data');
-      return res.json(generateDemoChartData(range));
+      console.log('📊 No database connection, returning empty data');
+      return res.json([]);
     }
 
     // Query the database for page views in the time range
@@ -1496,25 +1513,25 @@ app.get('/api/chart-data/:domain', apiLimiter, async (req, res) => {
 
     if (error) {
       console.error('📊 Database query error:', error);
-      return res.json(generateDemoChartData(range));
+      return res.json([]);
     }
 
     console.log('📊 Found page views:', data?.length || 0);
 
     if (!data || data.length === 0) {
-      console.log('📊 No data found, returning demo data');
-      return res.json(generateDemoChartData(range));
+      console.log('📊 No data found for owned domain, returning empty data');
+      return res.json([]);
     }
 
     // Group data by time intervals
     const chartData = groupDataByTime(data, range);
     console.log('📊 Sending chart data:', chartData.length, 'points');
-    
+
     res.json(chartData);
 
   } catch (error) {
     console.error('📊 Chart data endpoint error:', error);
-    res.json(generateDemoChartData(range));
+    res.json([]);
   }
 });
   
@@ -2692,7 +2709,106 @@ app.get('/api/debug-recent-visitors/:domain', apiLimiter, async (req, res) => {
     res.status(500).json({ error: error.message, data: [] });
   }
 });
+// Add this endpoint to your backend routes
+app.post('/api/ai/website-intelligence', apiLimiter, async (req, res) => {
+  try {
+    const { domain, pageViews, paths } = req.body;
+    const userId = req.headers['x-user-id'];
 
+    if (!userId) {
+      return res.status(400).json({ error: 'User ID is required' });
+    }
+
+    console.log('🤖 AI Website Intelligence analysis for:', domain);
+
+    // Enhanced AI analysis with better error handling
+    const model = ai.getGenerativeModel({ model: 'gemini-1.5-flash' });
+    
+    const prompt = `
+As a professional web analytics expert, analyze this website and provide comprehensive intelligence:
+
+DOMAIN: ${domain}
+DETECTED PATHS: ${JSON.stringify(paths?.slice(0, 50) || [], null, 2)}
+SAMPLE PAGE VIEWS: ${pageViews?.length || 0} total views
+
+Provide a detailed analysis in this exact JSON structure:
+{
+  "type": "ecommerce|blog|saas|leadgen|portfolio|news|education|community|corporate|nonprofit",
+  "confidence": 85,
+  "characteristics": ["characteristic1", "characteristic2"],
+  "detectedPages": {
+    "products": [],
+    "categories": [],
+    "checkout": [],
+    "content": [],
+    "features": [],
+    "pricing": [],
+    "signup": [],
+    "contact": [],
+    "about": [],
+    "services": []
+  },
+  "technicalInsights": {
+    "averageLoadTime": 2.5,
+    "mobileOptimized": true,
+    "hasSearch": false,
+    "hasFilters": false,
+    "hasRecommendations": false,
+    "hasBlog": false,
+    "hasEcommerce": false,
+    "hasForms": false
+  },
+  "contentAnalysis": {
+    "primaryPurpose": "Provide information and services",
+    "targetAudience": ["General visitors"],
+    "contentQuality": "medium",
+    "updateFrequency": "regular"
+  }
+}
+
+Be specific and evidence-based in your analysis. Focus on actionable insights.
+`;
+
+    const result = await model.generateContent(prompt);
+    const response = await result.response;
+    const text = response.text();
+    
+    const jsonMatch = text.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      const analysis = JSON.parse(jsonMatch[0]);
+      console.log('✅ AI Website Intelligence generated successfully');
+      return res.json(analysis);
+    }
+    
+    throw new Error('Invalid AI response format');
+  } catch (error) {
+    console.error('❌ AI website intelligence analysis error:', error);
+    // Return fallback analysis
+    const fallbackAnalysis = {
+      type: 'corporate',
+      confidence: 60,
+      characteristics: ['Basic website structure detected', 'Limited data available for full analysis'],
+      detectedPages: {},
+      technicalInsights: {
+        averageLoadTime: 2.5,
+        mobileOptimized: true,
+        hasSearch: false,
+        hasFilters: false,
+        hasRecommendations: false,
+        hasBlog: false,
+        hasEcommerce: false,
+        hasForms: false
+      },
+      contentAnalysis: {
+        primaryPurpose: 'Provide information and services',
+        targetAudience: ['General visitors'],
+        contentQuality: 'medium',
+        updateFrequency: 'regular'
+      }
+    };
+    res.json(fallbackAnalysis);
+  }
+});
 // --- ERROR HANDLING ---
 app.use((error, req, res, next) => {
   console.error('Error:', {
@@ -2708,7 +2824,212 @@ app.use((error, req, res, next) => {
     referenceId: generateErrorId()
   });
 });
+//conversion tunnel
+// Add to your backend routes
+app.post('/api/ai/website-intelligence', apiLimiter, async (req, res) => {
+  try {
+    const { domain, pageViews, paths } = req.body;
+    const userId = req.headers['x-user-id'];
 
+    if (!userId) {
+      return res.status(400).json({ error: 'User ID is required' });
+    }
+
+    console.log('🤖 AI Website Intelligence analysis for:', domain);
+
+    // Fetch actual website content for deeper analysis
+    const websiteContent = await fetchWebsiteContent(domain);
+    
+    const model = ai.getGenerativeModel({ model: 'gemini-1.5-flash' });
+    
+    const prompt = `
+As a professional web analytics expert, analyze this website and provide comprehensive intelligence:
+
+DOMAIN: ${domain}
+DETECTED PATHS: ${JSON.stringify(paths.slice(0, 50), null, 2)}
+SAMPLE PAGE VIEWS: ${pageViews.length} total views
+WEBSITE CONTENT SAMPLE: ${websiteContent ? websiteContent.substring(0, 10000) : 'Unable to fetch content'}
+
+Provide a detailed analysis in this exact JSON structure:
+{
+  "type": "ecommerce|blog|saas|leadgen|portfolio|news|education|community|corporate|nonprofit",
+  "confidence": 85,
+  "characteristics": ["characteristic1", "characteristic2", ...],
+  "detectedPages": {
+    "products": ["/path1", "/path2"],
+    "categories": ["/category1"],
+    "checkout": ["/checkout"],
+    "content": ["/blog", "/articles"],
+    "features": ["/features"],
+    "pricing": ["/pricing"],
+    "signup": ["/signup", "/register"],
+    "contact": ["/contact"],
+    "about": ["/about"],
+    "services": ["/services"]
+  },
+  "technicalInsights": {
+    "averageLoadTime": 2.5,
+    "mobileOptimized": true,
+    "hasSearch": true,
+    "hasFilters": true,
+    "hasRecommendations": false,
+    "hasBlog": true,
+    "hasEcommerce": true,
+    "hasForms": true
+  },
+  "contentAnalysis": {
+    "primaryPurpose": "Clear description of main purpose",
+    "targetAudience": ["audience1", "audience2"],
+    "contentQuality": "high|medium|low",
+    "updateFrequency": "frequent|regular|rare"
+  },
+  "businessModel": "Description of likely business model",
+  "conversionGoals": ["goal1", "goal2"],
+  "competitivePositioning": "Description of market position"
+}
+
+Be specific and evidence-based in your analysis. Focus on actionable insights.
+`;
+
+    const result = await model.generateContent(prompt);
+    const response = await result.response;
+    const text = response.text();
+    
+    const jsonMatch = text.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      const analysis = JSON.parse(jsonMatch[0]);
+      console.log('✅ AI Website Intelligence generated successfully');
+      return res.json(analysis);
+    }
+    
+    throw new Error('Invalid AI response format');
+  } catch (error) {
+    console.error('❌ AI website intelligence analysis error:', error);
+    // Return fallback analysis based on basic path analysis
+    const fallbackAnalysis = generateFallbackAnalysis(req.body.paths, req.body.domain);
+    res.json(fallbackAnalysis);
+  }
+});
+
+function generateFallbackAnalysis(paths, domain) {
+  const pathAnalysis = paths.join(' ').toLowerCase();
+  
+  let type = 'corporate';
+  let confidence = 60;
+  
+  if (pathAnalysis.includes('product') || pathAnalysis.includes('shop') || pathAnalysis.includes('cart')) {
+    type = 'ecommerce';
+    confidence = 75;
+  } else if (pathAnalysis.includes('blog') || pathAnalysis.includes('article') || pathAnalysis.includes('post')) {
+    type = 'blog';
+    confidence = 70;
+  } else if (pathAnalysis.includes('pricing') || pathAnalysis.includes('signup') || pathAnalysis.includes('feature')) {
+    type = 'saas';
+    confidence = 65;
+  }
+  
+  return {
+    type,
+    confidence,
+    characteristics: ['Basic structure detected', 'Limited data available for full analysis'],
+    detectedPages: {},
+    technicalInsights: {
+      mobileOptimized: true,
+      hasSearch: pathAnalysis.includes('search'),
+      hasFilters: pathAnalysis.includes('filter'),
+      hasRecommendations: false,
+      hasBlog: pathAnalysis.includes('blog'),
+      hasEcommerce: pathAnalysis.includes('product'),
+      hasForms: pathAnalysis.includes('contact')
+    },
+    contentAnalysis: {
+      primaryPurpose: 'Provide information and services',
+      targetAudience: ['General visitors'],
+      contentQuality: 'medium',
+      updateFrequency: 'regular'
+    }
+  };
+}
+//conversion tunnel intelligence
+// Add real-time content analysis endpoint
+app.post('/api/ai/content-analysis', apiLimiter, async (req, res) => {
+  try {
+    const { url, domain } = req.body;
+    const userId = req.headers['x-user-id'];
+
+    if (!userId) {
+      return res.status(400).json({ error: 'User ID is required' });
+    }
+
+    console.log('🔍 AI Content analysis for:', domain, url);
+
+    // Fetch the specific page content
+    const pageContent = await fetchPageContent(url || `https://${domain}`);
+    
+    const model = ai.getGenerativeModel({ model: 'gemini-1.5-flash' });
+    
+    const prompt = `
+Analyze this webpage content for conversion optimization:
+
+URL: ${url || domain}
+CONTENT: ${pageContent ? pageContent.substring(0, 15000) : 'Unable to fetch content'}
+
+Provide analysis in JSON format:
+{
+  "pageType": "homepage|product|blog|checkout|landing",
+  "conversionElements": ["element1", "element2"],
+  "missingElements": ["element1", "element2"],
+  "seoScore": 85,
+  "uxScore": 75,
+  "recommendations": ["rec1", "rec2"],
+  "conversionRate": 2.5
+}
+`;
+
+    const result = await model.generateContent(prompt);
+    const response = await result.response;
+    const text = response.text();
+    
+    const jsonMatch = text.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      const analysis = JSON.parse(jsonMatch[0]);
+      return res.json(analysis);
+    }
+    
+    throw new Error('Invalid AI response format');
+  } catch (error) {
+    console.error('AI content analysis error:', error);
+    res.status(500).json({ error: 'Content analysis failed' });
+  }
+});
+
+async function fetchPageContent(url){
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 8000);
+
+    const response = await fetch(url, {
+      signal: controller.signal,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (compatible; WebTrafficInsightAI/1.0)'
+      }
+    });
+
+    clearTimeout(timeoutId);
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+
+    const html = await response.text();
+    // Extract text content from HTML (basic extraction)
+    const textContent = html.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+    return textContent.substring(0, 20000);
+  } catch (error) {
+    console.error('Error fetching page content:', error);
+    return null;
+  }
+}
 // --- 404 HANDLER ---
 app.use((req, res) => {
   res.status(404).json({ 
