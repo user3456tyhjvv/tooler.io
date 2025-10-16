@@ -13,10 +13,57 @@ import { core } from '@paypal/checkout-server-sdk';
 import nodemailer from 'nodemailer';
 import { createServer } from 'http';
 import { Server } from 'socket.io';
+import cluster from 'cluster';
+import os from 'os';
+import logger, { requestLogger, performanceLogger, errorLogger } from './logger.js';
+import cacheManager from './cache.js';
 
-const app = express();
-const server = createServer(app);
-const port = process.env.PORT || 3001;
+// --- CLUSTERING SETUP ---
+const numCPUs = os.cpus().length;
+const isProduction = process.env.NODE_ENV === 'production';
+const enableClustering = process.env.CLUSTER_ENABLED !== 'false' && isProduction;
+
+if (enableClustering && cluster.isMaster) {
+  logger.info(`🚀 Starting cluster with ${numCPUs} workers`);
+
+  // Fork workers
+  for (let i = 0; i < numCPUs; i++) {
+    cluster.fork();
+  }
+
+  // Handle worker exits
+  cluster.on('exit', (worker, code, signal) => {
+    logger.warn(`Worker ${worker.process.pid} died with code ${code} and signal ${signal}`);
+    logger.info('Starting a new worker');
+    cluster.fork();
+  });
+
+  // Handle messages from workers
+  cluster.on('message', (worker, message) => {
+    if (message.type === 'performance') {
+      logger.info(`Performance from worker ${worker.process.pid}: ${message.data}`);
+    }
+  });
+
+  // Graceful shutdown for master
+  process.on('SIGTERM', () => {
+    logger.info('Master received SIGTERM, shutting down gracefully');
+    for (const id in cluster.workers) {
+      cluster.workers[id].kill();
+    }
+    process.exit(0);
+  });
+
+} else {}
+  // Worker process or development mode
+  const app = express();
+  const server = createServer(app);
+  const port = process.env.PORT || 3001;
+
+  // Log worker startup
+  if (enableClustering) {
+    logger.info(`Worker ${process.pid} started`);
+  }
 
 // --- SOCKET.IO SETUP ---
 const io = new Server(server, {
@@ -28,7 +75,7 @@ const io = new Server(server, {
 
 // --- CACHE SETUP ---
 import NodeCache from 'node-cache';
-const statsCache = new NodeCache({ stdTTL: 300 });
+const statsCache = new NodeCache({ stdTTL: 600 }); // Increased TTL from 300 to 600 seconds for production
 
 // --- INITIALIZATION ---
 const ai = new GoogleGenerativeAI({ apiKey: process.env.GEMINI_API_KEY });
@@ -274,7 +321,8 @@ app.use(cors({
       'https://www.gigatechshop.co.ke',
       'https://gigatechshop.co.ke',
       'https://www.yourspaceanalytics.info',
-      'https://yourspaceanalytics.info'
+      'https://yourspaceanalytics.info',
+      'https://tooler-io.onrender.com'
     ];
     
     if (allowedOrigins.indexOf(origin) !== -1) {
@@ -283,11 +331,19 @@ app.use(cors({
       callback(null, true);
     }
   },
-  credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'x-user-id']
-}));
-
+    credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
+  allowedHeaders: [
+    'Content-Type', 
+    'Authorization', 
+    'X-Requested-With', 
+    'x-user-id',
+    'Accept',
+    'Origin'
+  ],
+  exposedHeaders: ['Content-Length', 'X-Request-ID'],
+  maxAge: 86400 // 24 hours
+}))
 // Handle preflight requests
 app.options('/track', cors());
 app.options('/api/stats/:domain', cors());

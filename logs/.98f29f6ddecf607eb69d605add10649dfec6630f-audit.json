@@ -1,0 +1,20 @@
+{
+    "keep": {
+        "days": true,
+        "amount": 14
+    },
+    "auditLog": "C:\\Users\\sami\\Downloads\\web-traffic-insight-ai\\backend\\logs\\.98f29f6ddecf607eb69d605add10649dfec6630f-audit.json",
+    "files": [
+        {
+            "date": 1760561158686,
+            "name": "C:\\Users\\sami\\Downloads\\web-traffic-insight-ai\\backend\\logs\\error-2025-10-15.log",
+            "hash": "0b1da1dadf4f75c701aa22c2aebeaba187e25054bf6ba14459b625baa3ccc4fa"
+        },
+        {
+            "date": 1760602526062,
+            "name": "C:\\Users\\sami\\Downloads\\web-traffic-insight-ai\\backend\\logs\\error-2025-10-16.log",
+            "hash": "45fca499b0ee6e896462f978f0ffe8d3aae6673bdb29715a98b011e4beb40551"
+        }
+    ],
+    "hashType": "sha256"
+}
